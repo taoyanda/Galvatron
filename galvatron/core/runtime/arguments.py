@@ -187,7 +187,7 @@ def galvatron_training_args(parser, use_megatron=True):
         group.add_argument("--gpu_id", type=int, default=0, help="Id of GPU to run.")
     else:
         group.add_argument("--no-shared-storage", action="store_false", dest="shared_storage", help="Cluster is not shared storage.")
-    
+
     # MoE arguments
     group.add_argument(
         "--is_moe_model",
@@ -206,7 +206,7 @@ def galvatron_training_args(parser, use_megatron=True):
         default=1,
         help="Experts parallel degree.",
     )
-    
+
     group.add_argument(
         "--global_tp_of_ep_deg",
         type=int,
@@ -238,5 +238,35 @@ def galvatron_training_args(parser, use_megatron=True):
         "--recompute_communication",
         action="store_true",
         help="Whether to recompute communication.",
+    )
+    # PP-profiling / deterministic-benchmarking knobs (see PP_PROFILING_PLAN.md)
+    group.add_argument(
+        "--static_input",
+        action="store_true",
+        help="Reuse a single deterministic batch across all training iterations. "
+        "The batch is built once on rank 0 and broadcast across the DP group. "
+        "Intended for PP cost-model profiling under a frozen LAER layout. "
+        "Combine with --dropout_prob 0 to keep routing bit-identical across iters.",
+    )
+    group.add_argument(
+        "--laer_freeze_after_iter",
+        type=int,
+        default=-1,
+        help="Freeze the LAER expert layout once each dispatcher has submitted this many "
+        "solver iterations. -1 disables freezing (default). Only meaningful when "
+        "ENABLE_SOLVER=1.",
+    )
+    group.add_argument(
+        "--moe_computation_config_path",
+        type=str,
+        default="./configs/computation_profiling_bf16_mixtral-8x7b.json",
+        help="Path to LAER solver computation-cost config. Previously read via getattr in "
+        "smart_routing.py without CLI registration.",
+    )
+    group.add_argument(
+        "--moe_network_config_path",
+        type=str,
+        default="./configs/network_config.json",
+        help="Path to LAER solver network-bandwidth config.",
     )
     return parser

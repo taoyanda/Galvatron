@@ -1,5 +1,6 @@
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 import os
 import torch.distributed as dist
@@ -121,7 +122,7 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
         self.history_num_global_tokens_per_expert = []
 
         args = get_args()
-        
+
         # Async Linear Programming Solver configuration
         self.async_lp_solver_config = {
             "enabled": os.environ.get("ENABLE_SOLVER", "0") == "1",
@@ -129,10 +130,20 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
             "network_config_path": getattr(args, 'moe_network_config_path', './configs/network_config.json'),
             "hidden_size": getattr(args, 'hidden_size', 4096),
             "global_checkpoint": getattr(args, 'global_checkpoint', True),
-            "expert_capacity_per_device": self.num_local_experts
+            "expert_capacity_per_device": self.num_local_experts,
+            # -1 disables freeze. When >= 0, stop submitting new solver tasks once
+            # solver_iter >= freeze_after_iter.
+            "freeze_after_iter": getattr(args, 'laer_freeze_after_iter', -1),
         }
         self.async_lp_task_id = None
         self.need_to_sync = False
+        self._freeze_logged = False
+        self._prev_placement_numpy = None
+        # Cache args.static_input for the determinism-verification log below.
+        self._static_input = getattr(args, 'static_input', False)
+        self._static_ref_counts = None
+        self._static_check_count = 0
+        self._static_check_budget = 20
 
     def get_smart_routing(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
@@ -161,6 +172,23 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
         else:
             self.history_num_global_tokens_per_expert.append(num_global_tokens_per_expert.clone())
             self.history_num_global_tokens_per_expert.pop(0)
+
+        # --static_input determinism check: under a fixed dummy batch the
+        # per-expert global token counts must be bit-identical across iters,
+        # otherwise the LAER solver cannot converge to a stable layout. Gated
+        # by a small iteration budget to avoid log spam.
+        if self._static_input and self._static_check_count < self._static_check_budget:
+            latest_cpu = num_global_tokens_per_expert.detach().to("cpu")
+            if self._static_ref_counts is None:
+                self._static_ref_counts = latest_cpu.clone()
+            else:
+                match = torch.equal(self._static_ref_counts, latest_cpu)
+                print(
+                    f"[layer {self.layer_number}] static_input det check "
+                    f"{self._static_check_count}: {'MATCH' if match else 'MISMATCH'}",
+                    flush=True,
+                )
+            self._static_check_count += 1
         
         # Submit async linear programming optimization task
         if (self.async_lp_solver_config["enabled"]):
@@ -513,27 +541,40 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
     
     def sync_lp_solver(self):
         """
-        Sync LP solver after forward pass.
+        Sync LP solver after forward pass. If --laer_freeze_after_iter has been
+        reached, stop submitting new solver tasks and let the last placement
+        stand. Prefetch polling in `_async_lp_prefetch_logic` still drains any
+        in-flight task submitted before the freeze.
         """
-        if (self.async_lp_solver_config["enabled"]):
-            self.cuda_dtoh_stream.synchronize()
-            self.solver_iter += 1
-            self.async_lp_task_id = submit_lp_optimization(
-                history_data=self.total_num_global_tokens_per_expert,
-                layer_number=self.layer_number,
-                computation_config_path=self.async_lp_solver_config["computation_config_path"],
-                network_config_path=self.async_lp_solver_config["network_config_path"],
-                expert_capacity_per_device=self.async_lp_solver_config["expert_capacity_per_device"],
-                hidden_size=self.async_lp_solver_config["hidden_size"],
-                global_checkpoint=self.async_lp_solver_config["global_checkpoint"],
-                solver_iter=self.solver_iter,
-                global_expert_indices_numpy=self.global_expert_indices_numpy,
-            )
+        if not self.async_lp_solver_config["enabled"]:
+            return
+        freeze_after = self.async_lp_solver_config.get("freeze_after_iter", -1)
+        if freeze_after is not None and freeze_after >= 0 and self.solver_iter >= freeze_after:
+            if not self._freeze_logged:
+                print(
+                    f"[layer {self.layer_number}] layout frozen at iter {self.solver_iter}",
+                    flush=True,
+                )
+                self._freeze_logged = True
+            return
+        self.cuda_dtoh_stream.synchronize()
+        self.solver_iter += 1
+        self.async_lp_task_id = submit_lp_optimization(
+            history_data=self.total_num_global_tokens_per_expert,
+            layer_number=self.layer_number,
+            computation_config_path=self.async_lp_solver_config["computation_config_path"],
+            network_config_path=self.async_lp_solver_config["network_config_path"],
+            expert_capacity_per_device=self.async_lp_solver_config["expert_capacity_per_device"],
+            hidden_size=self.async_lp_solver_config["hidden_size"],
+            global_checkpoint=self.async_lp_solver_config["global_checkpoint"],
+            solver_iter=self.solver_iter,
+            global_expert_indices_numpy=self.global_expert_indices_numpy,
+        )
 
-            if hasattr(self, "nxt_dispatcher") and self.fsdp_handle._training_state == HandleTrainingState.FORWARD:
-                self.nxt_dispatcher.sync_htod()
-            # Pass task ID to FSDP layer for prefetch result retrieval
-            # self._notify_fsdp_layer_task_id(self.async_lp_task_id, self.cuda_htod_stream)
+        if hasattr(self, "nxt_dispatcher") and self.fsdp_handle._training_state == HandleTrainingState.FORWARD:
+            self.nxt_dispatcher.sync_htod()
+        # Pass task ID to FSDP layer for prefetch result retrieval
+        # self._notify_fsdp_layer_task_id(self.async_lp_task_id, self.cuda_htod_stream)
 
     def _maybe_update_cuda_sync_point(self, point: str):
         """
@@ -599,7 +640,22 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
             # Here optimization results can be applied to routing strategy
             # Actual implementation needs to be adjusted based on specific MoE router interface
             # print(f"Linear programming optimization result: {result}")
-            self.global_expert_indices_numpy = result.get("expert_placement_numpy")
+            new_placement_numpy = result.get("expert_placement_numpy")
+            # Layout-change diagnostic: only meaningful before freeze, since no
+            # further solver tasks will be submitted afterward.
+            if not self._freeze_logged and new_placement_numpy is not None:
+                if self._prev_placement_numpy is not None:
+                    try:
+                        changed = not np.array_equal(self._prev_placement_numpy, new_placement_numpy)
+                    except Exception:
+                        changed = True
+                    tag = "changed" if changed else "stable"
+                    print(
+                        f"[layer {self.layer_number}] layout {tag} at iter {self.solver_iter}",
+                        flush=True,
+                    )
+                self._prev_placement_numpy = new_placement_numpy
+            self.global_expert_indices_numpy = new_placement_numpy
             self.global_expert_indices = result.get("expert_placement")
             self.global_expert_locations = result.get("global_expert_locations")
             self.inverse_expert_map = result.get("inverse_expert_map")
