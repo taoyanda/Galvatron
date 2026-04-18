@@ -51,10 +51,17 @@ def train(args):
     if args.profile_forward:
         torch.set_grad_enabled(False)
 
+    static_input = getattr(args, "static_input", False)
+    cached_batch = None
     for ep in range(args.epochs):
         if not args.check_loss and not args.profile:
             trainloader = tqdm(trainloader)
         for iter, batch in enumerate(trainloader):
+            if static_input:
+                if cached_batch is None:
+                    cached_batch = batch
+                else:
+                    batch = cached_batch
             tokens, kwargs, loss_func = batch
             profiler.profile_time_start(iter)
             profiler.profile_memory(iter, "Before Forward")

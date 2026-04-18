@@ -149,23 +149,113 @@ def fake_tensor(bsz):
     return torch.zeros([bsz, 1], device="cuda")
 
 
+# Cache for --static_input mode. Populated on the first call to get_batch and
+# reused thereafter. Raw batch tensors + rotary embedding are cached; the
+# chunked micro_lossmask must be rebuilt per call because loss_func pops from
+# it.
+_static_batch_cache = {"cached": False, "batch": None, "rotary_embedding": None}
+
+
+def _build_static_synthetic_batch(args, batch_size):
+    """Build a deterministic synthetic batch without touching the data iterator.
+
+    Uses a CPU-side torch.Generator seeded from args.seed so every rank produces
+    bit-identical tokens independent of CUDA RNG state (which is perturbed by
+    model init, dropout, etc.).
+    """
+    seq_len = args.seq_length
+    vocab_size = args.vocab_size
+    device = torch.cuda.current_device()
+    seed = getattr(args, "seed", 1234)
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    tokens_full = torch.randint(
+        0, vocab_size, (batch_size, seq_len + 1), generator=gen, dtype=torch.long
+    ).to(device)
+    tokens = tokens_full[:, :-1].contiguous()
+    labels = tokens_full[:, 1:].contiguous()
+    loss_mask = torch.ones((batch_size, seq_len), dtype=torch.float32, device=device)
+    position_ids = (
+        torch.arange(seq_len, dtype=torch.long, device=device)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .contiguous()
+    )
+    if getattr(args, "use_flash_attn", False):
+        attention_mask = None
+    else:
+        mask = torch.tril(torch.ones((1, seq_len, seq_len), device=device)).view(
+            1, 1, seq_len, seq_len
+        )
+        attention_mask = mask < 0.5
+    return {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": position_ids,
+        "attention_mask": attention_mask,
+    }
+
+
+def _broadcast_batch_across_dp(batch):
+    """Broadcast DP-rank-0's synthetic tensors across the DP group. With the
+    deterministic CPU generator above all ranks already produce identical
+    tokens; this is a safety net against residual float-order divergence."""
+    if mpu.get_data_parallel_world_size() <= 1:
+        return
+    dp_group = mpu.get_data_parallel_group()
+    src_global_rank = torch.distributed.get_global_rank(dp_group, 0)
+    for k in ("tokens", "labels", "loss_mask", "position_ids", "attention_mask"):
+        t = batch.get(k)
+        if isinstance(t, torch.Tensor):
+            torch.distributed.broadcast(t, src=src_global_rank, group=dp_group)
+
+
 def get_batch(data_iterator):
     """Generate a batch."""
 
     args = get_args()
     # TODO: this is pretty hacky, find a better way
     batch_size = args.global_train_batch_size // mpu.get_data_parallel_world_size()
+    static_input = getattr(args, "static_input", False)
     # TODO: this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return fake_tensor(batch_size), {}, None
         # return torch.empty(args.micro_batch_size,args.seq_length+1).cuda().long()
 
-    args = get_args()
+    if static_input:
+        if not _static_batch_cache["cached"]:
+            batch = _build_static_synthetic_batch(args, batch_size)
+            _broadcast_batch_across_dp(batch)
+            rotary_pos_emb = RotaryEmbedding(
+                args.hidden_size // args.num_attention_heads,
+                args.rotary_percent,
+                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+                rotary_base=args.rotary_base,
+            )
+            rotary_embedding = rotary_pos_emb(args.seq_length)
+            _static_batch_cache["cached"] = True
+            _static_batch_cache["batch"] = batch
+            _static_batch_cache["rotary_embedding"] = rotary_embedding
+        batch = _static_batch_cache["batch"]
+        rotary_embedding = _static_batch_cache["rotary_embedding"]
+        micro_lossmask = chunk_batch([batch["loss_mask"]], get_chunks(args))
+        return (
+            batch["tokens"],
+            {
+                "position_ids": batch["position_ids"],
+                "attention_mask": batch["attention_mask"],
+                "labels": batch["labels"],
+                "rotary_embedding": rotary_embedding,
+            },
+            partial(loss_func, micro_lossmask),
+        )
+
     batch = get_batch_on_this_tp_rank(data_iterator)
 
     rotary_pos_emb = RotaryEmbedding(
-            args.hidden_size // args.num_attention_heads, 
-            args.rotary_percent, 
+            args.hidden_size // args.num_attention_heads,
+            args.rotary_percent,
             seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
             rotary_base=args.rotary_base
         )
