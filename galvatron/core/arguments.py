@@ -2,12 +2,16 @@ from megatron.training.initialize import initialize_megatron
 from megatron.training import get_args as get_megatron_args
 import argparse
 from .runtime.arguments import galvatron_training_args
+from .profiler.arguments import galvatron_profile_args
 
 def initialize_galvatron(model_args = None, mode="train_dist"):
     use_megatron = False
+    extra_args_provider = []
     if mode in ["train_dist", "train"]:
         use_megatron = (mode == "train_dist")
         extra_args_provider = [lambda parser: galvatron_training_args(parser, use_megatron)]
+    elif mode == "profile":
+        extra_args_provider = [galvatron_profile_args]
     if model_args is not None:
         extra_args_provider.append(model_args)
     if use_megatron:
