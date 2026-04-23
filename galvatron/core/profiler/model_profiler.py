@@ -356,16 +356,20 @@ class ModelProfiler(BaseProfiler):
                     val = config[key]
                     avg_time = (val - val_base) / bsz / (self.args.layernum_max - self.args.layernum_min)
                     write_key = f"layertype_{idx}_bsz{bsz}_seq{seq[idx]}"
+                    profile_unit = getattr(self.args, "profile_unit", "all")
+                    if profile_unit != "all":
+                        write_key += f"_{profile_unit}"
                     config[write_key] = avg_time
                     total_avg_time.append(avg_time)
 
-                # Calculate other computation overhead
-                other_time = val_base
-                for idx in range(len(total_avg_time)):
-                    other_time -= layernum_lists[0][idx] * total_avg_time[idx] * bsz
-                other_time /= bsz
-                write_key = f"layertype_other_bsz{bsz}_{seq_info}"
-                config[write_key] = max(other_time, 0)
+                # Calculate other computation overhead (only meaningful for full-layer profiling)
+                if getattr(self.args, "profile_unit", "all") == "all":
+                    other_time = val_base
+                    for idx in range(len(total_avg_time)):
+                        other_time -= layernum_lists[0][idx] * total_avg_time[idx] * bsz
+                    other_time /= bsz
+                    write_key = f"layertype_other_bsz{bsz}_{seq_info}"
+                    config[write_key] = max(other_time, 0)
 
                 # Write results to config file
                 write_json_config(config, time_config_path)
@@ -730,6 +734,9 @@ class ModelProfiler(BaseProfiler):
                 s += f"_{seq}"
             else:
                 s += f"_seq{seq}"
+        profile_unit = getattr(self.args, "profile_unit", "all")
+        if profile_unit != "all":
+            s += f"_{profile_unit}"
         if rank is not None and type is not None:
             s += f"_rank{rank}_{type}"
         return s
