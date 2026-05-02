@@ -204,7 +204,13 @@ class PipelineParallel(nn.Module):
             dp_of_ep_groups_cur_stage = dp_of_ep_groups[self.stage_start_idx : self.stage_end_idx]
         else:
             dp_of_ep_groups_cur_stage = None
-        # default_process_group = dp_groups[0]
+        # Constrain the root FSDP wrapper to this PP stage's DP group
+        # Avoid all-gather across pipeline stages by using WORLD
+        # For DP=1 the picked group is size 1, which makes FSDP's shard a per-rank no-op
+        stage_default_pg = next(
+            (g for g in dp_groups_cur_stage if g is not None),
+            None,
+        )
         self.model_cur_stage = wrap_modules_data_parallel(
             module_list=self.model_cur_stage,
             dp_types=dp_types_cur_stage,
@@ -213,7 +219,7 @@ class PipelineParallel(nn.Module):
             dp_of_ep_groups=dp_of_ep_groups_cur_stage,
             pp_devices=pp_devices_cur_stage,
             mixed_precision=mixed_precision,
-            default_process_group=None,
+            default_process_group=stage_default_pg,
             wrap_block_name=wrap_block_name,
             wrap_other_block_name=wrap_other_block_name,
             tp_groups=tp_groups_cur_stage,

@@ -4,6 +4,12 @@ export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-29500}
 export NODE_RANK=${RANK:-0}
 
+export OMP_NUM_THREADS=8
+export NCCL_DEBUG=WARN
+
+export CUDA_HOME='/usr/local/cuda-12.1'
+
+
 # Disable LAER online re-planning during profiling so per-layer time stays
 # stationary (linear-fit assumption).
 export ENABLE_SOLVER=0
@@ -26,10 +32,11 @@ MODEL_ARGS="
 
 PROFILE_ARGS="
     --profile_mode batch \
-    --profile_type computation \
+    --profile_metric computation \
     --profile_min_batch_size 1 \
     --profile_max_batch_size 4 \
     --profile_batch_size_step 1 \
+    --profile_seq_length_list 4096 \
     --layernum_min 1 \
     --layernum_max 2 \
     --mixed_precision bf16 \

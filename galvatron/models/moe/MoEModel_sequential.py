@@ -54,14 +54,35 @@ class MoEEmbeddings_(nn.Module):
                 torch.distributed.get_world_size(self.sp_group),
             )
 
-    def forward(self, tokens, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None):
-        # tokens = input_ids[:, :-1].contiguous()
-        # labels = input_ids[:, 1:].contiguous()
+    def forward(
+        self,
+        tokens,
+        position_ids=None,
+        attention_mask=None,
+        labels=None,
+        rotary_embedding=None,
+    ):
         if self.vocab_sp:
             tokens = tokens[:, self.seq_start_index : self.seq_end_index].contiguous()
-        
-        # [b, s] -> [s / tp, b, h]
+
+        # Fix 5: drain the embedding's TP all-reduce on the current stream
+        # and barrier on the TP group before continuing. Without this the
+        # TP all-reduce can stay in flight while subsequent layer collectives
+        # are queued, causing tp=4 dp=1 to hang at the next MoE layer's
+        # internal sync. The synchronize+barrier here is intentional — do
+        # not remove without re-validating tp=4 ep=1 end-to-end.
         hidden_states = self.embed_tokens(tokens)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        torch.distributed.barrier(group=self.tp_group)
+
+        # VocabParallelEmbedding emits SBH only when sequence_parallel=True
+        # (via scatter_to_sequence_parallel_region). Without SP it returns BSH,
+        # which breaks every downstream module that assumes SBH (attention
+        # rotary lookup, cross-entropy reduction, etc.). Coerce to SBH here so
+        # all profile units and the full training path see the same layout.
+        if not self.sequence_parallel:
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
         return hidden_states
 
 
@@ -71,9 +92,19 @@ class MoELayers_(nn.Module):
         model = model.model
         self.layer = model.layers[layer_idx]
 
-    def forward(self, hidden_states, position_ids=None, attention_mask=None, labels=None, rotary_embedding=None):
-        # attention_mask = get_ltor_masks_and_position_ids(input_ids)
-        hidden_states = self.layer(hidden_states, attention_mask=attention_mask, rotary_embedding=rotary_embedding)  # , position_ids = position_ids)
+    def forward(
+        self,
+        hidden_states,
+        position_ids=None,
+        attention_mask=None,
+        labels=None,
+        rotary_embedding=None,
+    ):
+        hidden_states = self.layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            rotary_embedding=rotary_embedding,
+        )
         return hidden_states
 
 

@@ -37,7 +37,7 @@ else
     exit 1
 fi
 
-export CHECKPOINT=1
+export CHECKPOINT=${CHECKPOINT:-1}
 export ENABLE_SOLVER=1
 
 LAUNCHER="python3 -m torch.distributed.launch"
@@ -53,9 +53,9 @@ else
     TRAINER="train_dist.py"
 fi
 
-CHECKPOINT_PATH=$BASE_DIR/checkpoints/laer/$MODEL_SIZE
-TOKENIZER_MODEL=$BASE_DIR/tokenizers/mixtral
-DATA_PATH=$BASE_DIR/datasets/processed/$DATA/mixtral_text_document
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-$BASE_DIR/checkpoints/laer/$MODEL_SIZE}
+TOKENIZER_MODEL=${TOKENIZER_MODEL:-$BASE_DIR/tokenizers/mixtral}
+DATA_PATH=${DATA_PATH:-$BASE_DIR/datasets/processed/$DATA/mixtral_text_document}
 
 MODEL_ARGS="
     --model_size $MODEL_SIZE \
@@ -101,16 +101,17 @@ DATA_ARGS="
     --tokenizer-type HuggingFaceTokenizer \
     --tokenizer-model ${TOKENIZER_MODEL}
 "
-
-CKPT_ARGS="
-    --load $CHECKPOINT_PATH
-"
+ 
+CKPT_ARGS=""
+if [ "${NO_LOAD:-0}" != "1" ]; then
+    CKPT_ARGS="--load $CHECKPOINT_PATH"
+fi
 
 PARALLEL_ARGS="
     --pp_deg 1 \
     --global_tp_deg 1 \
     --global_tp_consec 1 \
-    --global_ep_deg 32 \
+    --global_ep_deg 4 \
     --global_tp_of_ep_deg 1 \
     --sdp 1 \
     --global_checkpoint $CHECKPOINT \

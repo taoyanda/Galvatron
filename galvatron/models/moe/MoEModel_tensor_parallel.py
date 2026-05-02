@@ -114,7 +114,7 @@ class MoERouter(nn.Module):
             self.predict(hidden_states)
         probs, routing_map = self.router(hidden_states)
         return probs, routing_map
-    
+
 # TODO: Add shared expert support
 class MoEMLP_tp(nn.Module):
     def __init__(self, config, token_dispatcher, layer_number, tp_group=None, ep_group=None, tp_of_ep_group=None, tp_and_ep_group=None, test_mode=False):
@@ -330,25 +330,43 @@ class MoELayer_tp(nn.Module):
             rotary_embedding,
         )
         probs, routing_map = self.router(attention_output)
-        routing_map, probs = self.token_dispatcher.get_smart_routing(routing_map, probs)
+        if self.use_fsep:
+            routing_map, probs = self.token_dispatcher.get_smart_routing(
+                routing_map, probs
+            )
         if self.recompute_communication:
             mlp_output, mlp_bias = self.mlp(attention_output, routing_map, probs)
         else:
-            (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
+            dispatched_input, tokens_per_expert = (
+                self.token_dispatcher.token_permutation(
                     attention_output, probs, routing_map
                 )
+            )
             expert_output, mlp_bias = self.mlp(dispatched_input, tokens_per_expert)
-            mlp_output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
-        self.token_dispatcher.sync_lp_solver()
+            mlp_output, mlp_bias = self.token_dispatcher.token_unpermutation(
+                expert_output, mlp_bias
+            )
+        if self.use_fsep:
+            self.token_dispatcher.sync_lp_solver()
         layer_output = mlp_output + mlp_residual
         return layer_output
 
+
 class MoELayer_attention(nn.Module):
-    def __init__(self, config, layer_number, tp_group=None, sp_group=None, ep_group=None, tp_of_ep_group=None, tp_and_ep_group=None):
+    def __init__(
+        self,
+        config,
+        layer_number,
+        tp_group=None,
+        sp_group=None,
+        ep_group=None,
+        tp_of_ep_group=None,
+        tp_and_ep_group=None,
+    ):
         super().__init__()
         self.attention = MoEAttention_tp(config, layer_number, tp_group, sp_group)
         self.idx = layer_number
-    
+
     def forward(
         self,
         hidden_states,
@@ -362,20 +380,39 @@ class MoELayer_attention(nn.Module):
         )
         return attention_output
 
+
 class MoELayer_mlp(nn.Module):
-    def __init__(self, config, layer_number, tp_group=None, sp_group=None, ep_group=None, tp_of_ep_group=None, tp_and_ep_group=None):
+    def __init__(
+        self,
+        config,
+        layer_number,
+        tp_group=None,
+        sp_group=None,
+        ep_group=None,
+        tp_of_ep_group=None,
+        tp_and_ep_group=None,
+    ):
         super().__init__()
-        self.mlp = MoEMLP_tp(config, layer_number, tp_group, ep_group, tp_of_ep_group, tp_and_ep_group, True)
+        self.mlp = MoEMLP_tp(
+            config,
+            token_dispatcher=None,
+            layer_number=layer_number,
+            tp_group=tp_group,
+            ep_group=ep_group,
+            tp_of_ep_group=tp_of_ep_group,
+            tp_and_ep_group=tp_and_ep_group,
+            test_mode=True,
+        )
         self.idx = layer_number
-    
+
     def forward(
         self,
         hidden_states,
         attention_mask=None,
         rotary_embedding=None,
     ):
-        layer_output = self.mlp(hidden_states, None)
-        return layer_output
+        expert_output, _mlp_bias = self.mlp(hidden_states, None)
+        return expert_output
 
 
 def construct_tensor_parallel_model(model, config, tp_groups_enc, sp_groups_enc, ep_groups_enc, tp_of_ep_groups_enc, tp_and_ep_groups_enc):

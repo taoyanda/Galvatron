@@ -75,6 +75,6 @@ def moe_model_hp(config, args):
 def get_runtime_profiler(args, path, config, start_iter=10, end_iter=20):
     profiler = RuntimeProfiler(args)
     profiler.set_profiler_dist(
-        path, model_layer_configs(config), model_name(config), start_iter=start_iter, end_iter=end_iter
+        path, model_layer_configs(config), model_name(config, args), start_iter=start_iter, end_iter=end_iter
     )
     return profiler

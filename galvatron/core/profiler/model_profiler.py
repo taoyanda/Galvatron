@@ -15,12 +15,14 @@ class ModelProfiler(BaseProfiler):
     """Model profiler for analyzing model performance characteristics including computation and memory usage"""
 
     def __init__(self, args):
-        """Initialize model profiler
+        """
+        Initialize model profiler
+        Deprecation: profile_metric used to be profile_type, renamed for conflicts
 
         Args:
             args: Arguments containing profiling configuration including:
                 - profile_mode: Profiling mode ('static', 'batch', or 'sequence')
-                - profile_type: Type of profiling ('computation' or 'memory')
+                - profile_metric: Profiling metric ('computation' or 'memory')
                 - profile_batch_size: Batch size for static profiling
                 - profile_min/max_batch_size: Range for batch size profiling
                 - profile_min/max_seq_length: Range for sequence length profiling
@@ -107,7 +109,7 @@ class ModelProfiler(BaseProfiler):
             elif args.profile_mode == "sequence":
                 if self.num_layertype > 1:
                     assert False, "Sequence profiling only support single layertype!"
-                if args.profile_type == "computation":
+                if args.profile_metric == "computation":
                     assert args.profile_min_seq_length is not None and args.profile_max_seq_length is not None
                     self.sequence_length_list.append(
                         list(
@@ -118,7 +120,7 @@ class ModelProfiler(BaseProfiler):
                             )
                         )
                     )
-                elif args.profile_type == "memory":
+                elif args.profile_metric == "memory":
                     assert args.profile_min_seq_length is not None and args.profile_max_seq_length is not None
                     # For memory profiling, sequence lengths must be powers of 2
                     assert (
@@ -178,6 +180,49 @@ class ModelProfiler(BaseProfiler):
 
         return self.batch_size_list
 
+    def _wrap_with_timeout(
+        self, cmd: str, secs: Optional[int] = None, kill_after: int = 30
+    ) -> str:
+        """
+        Add timeout to an inner torchrun launch during profiling.
+
+        timeout's exit codes are forwarded through os.system: 124 = TERM after
+        N seconds, 137 = SIGKILL after grace. The timeout is read from
+        GALVATRON_PROFILE_INNER_TIMEOUT (seconds, default 600). 0/unset/non-int
+        disables the wrapper.
+        """
+        if secs is None:
+            secs = int(os.getenv("GALVATRON_PROFILE_INNER_TIMEOUT", "0"))
+        if secs <= 0:
+            return cmd
+        return f"timeout --kill-after={kill_after} {secs} {cmd}"
+
+    def _report_return_code(self, return_code: int) -> None:
+        """
+        Log non-zero return codes from os.system and ABORT the sweep on timeout.
+
+        Per project rule (memory: feedback_hang_stop_restart): once any inner
+        config hangs, so every subsequent config inherits the corruption and
+        cascades. We must NOT advance the sweep — surface the failure as a
+        non-zero exit so the outer shell loop and the `tee` log preserve the
+        signal.
+        """
+        if return_code == 0:
+            return
+        sig = return_code & 0x7F
+        exit_code = (return_code >> 8) & 0xFF
+        if exit_code == 124:
+            msg = (
+                "[inner timeout] torchrun TERMed after GALVATRON_PROFILE_INNER_TIMEOUT"
+            )
+        elif exit_code == 137 or sig == 9:
+            msg = "[inner timeout] torchrun SIGKILLed after kill-after grace"
+        else:
+            msg = f"[inner failure] os.system rc={return_code} (exit={exit_code} sig={sig})"
+        print(msg, flush=True)
+        print("[abort] cascade-prevention: stopping the whole sweep", flush=True)
+        raise SystemExit(2)
+
     def launch_profiling_scripts(self) -> None:
         """Launch profiling scripts for memory or computation profiling
 
@@ -190,12 +235,16 @@ class ModelProfiler(BaseProfiler):
         """
         args = self.args
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-        MODEL_ARGS, PROFILE_ARGS, LAUNCH_SCRIPTS, world_size, layernum_lists = self.prepare_launch_args()
+        model_args, profile_args, launch_scripts, world_size, layernum_lists = self.prepare_launch_args()
 
-        if args.profile_type == "memory":
-            self._launch_memory_profiling(MODEL_ARGS, PROFILE_ARGS, LAUNCH_SCRIPTS, world_size, layernum_lists)
-        elif args.profile_type == "computation":
-            self._launch_computation_profiling(MODEL_ARGS, PROFILE_ARGS, LAUNCH_SCRIPTS, layernum_lists)
+        if args.profile_metric == "memory":
+            self._launch_memory_profiling(
+                model_args, profile_args, launch_scripts, world_size, layernum_lists
+            )
+        elif args.profile_metric == "computation":
+            self._launch_computation_profiling(
+                model_args, profile_args, launch_scripts, layernum_lists
+            )
 
     def _launch_memory_profiling(
         self, MODEL_ARGS: str, PROFILE_ARGS: str, LAUNCH_SCRIPTS: str, world_size: int, layernum_lists: List[List[int]]
@@ -220,13 +269,23 @@ class ModelProfiler(BaseProfiler):
         if args.profile_mode != "static":
             max_tp_deg = 1
         sequence_length_list = list(product(*self.sequence_length_list))
+        ep_deg = getattr(self.args, "global_ep_deg", 1) if getattr(self.args, "use_fsep", False) else 1
+        bsz = getattr(self.args, "profile_batch_size", 1) or 1
+
+        def _bsz_compatible(pp_, tp_):
+            parallel_product = pp_ * tp_ * ep_deg
+            if parallel_product == 0 or world_size % parallel_product != 0:
+                return False
+            dp_deg = world_size // parallel_product
+            return dp_deg <= bsz and bsz % dp_deg == 0
+
         for seq in sequence_length_list:
             PROFILE_ARGS = self.prepare_profile_args()
             pp_deg = 1
             for checkpoint in [0, 1]:
                 tp_deg = 1
                 while tp_deg <= max_tp_deg:
-                    if pp_deg * tp_deg <= world_size:
+                    if pp_deg * tp_deg <= world_size and _bsz_compatible(pp_deg, tp_deg):
                         for enable_vocab_tp in [0, 1]:
                             if tp_deg == 1 and enable_vocab_tp == 1:
                                 continue
@@ -238,10 +297,14 @@ class ModelProfiler(BaseProfiler):
                                 args_["global_tp_deg"] = tp_deg
                                 args_["global_checkpoint"] = checkpoint
                                 args_["vocab_tp"] = tp_deg if enable_vocab_tp == 1 else 1
+                                if getattr(self.args, "use_fsep", False):
+                                    args_["global_tp_of_ep_deg"] = tp_deg
                                 ARGS_ = self.args2str(args_)
                                 CMD = LAUNCH_SCRIPTS + MODEL_ARGS + PROFILE_ARGS + ARGS_
+                                CMD = self._wrap_with_timeout(CMD)
                                 print(CMD)
-                                os.system(CMD)
+                                rc = os.system(CMD)
+                                self._report_return_code(rc)
                     if checkpoint:
                         break
                     tp_deg *= 2
@@ -250,7 +313,7 @@ class ModelProfiler(BaseProfiler):
                 layernum = pp_deg
                 tp_deg = 1
                 while tp_deg <= max_tp_deg:
-                    if pp_deg * tp_deg <= world_size:
+                    if pp_deg * tp_deg <= world_size and _bsz_compatible(pp_deg, tp_deg):
                         for enable_vocab_tp in [0, 1]:
                             if tp_deg == 1 and enable_vocab_tp == 1:
                                 continue
@@ -261,10 +324,14 @@ class ModelProfiler(BaseProfiler):
                             args_["global_tp_deg"] = tp_deg
                             args_["global_checkpoint"] = 0
                             args_["vocab_tp"] = tp_deg if enable_vocab_tp == 1 else 1
+                            if getattr(self.args, "use_fsep", False):
+                                args_["global_tp_of_ep_deg"] = tp_deg
                             ARGS_ = self.args2str(args_)
                             CMD = LAUNCH_SCRIPTS + MODEL_ARGS + PROFILE_ARGS + ARGS_
+                            CMD = self._wrap_with_timeout(CMD)
                             print(CMD)
-                            os.system(CMD)
+                            rc = os.system(CMD)
+                            self._report_return_code(rc)
                     tp_deg *= 2
 
     def _launch_computation_profiling(
@@ -281,22 +348,61 @@ class ModelProfiler(BaseProfiler):
         Note:
             Supports all profile modes (static, batch, sequence)
         """
+        world_size = int(os.getenv("NUM_GPUS_PER_NODE", "1")) * int(
+            os.getenv("NUM_NODES", "1")
+        )
+        max_tp_deg = min(world_size, self.args.max_tp_deg)
+        batch_size_list = self.get_bsz_list()
+        sequence_length_list = list(product(*self.sequence_length_list))
         for layernum_list in layernum_lists:
             args_ = {}
             self.get_layernum_args(args_, layernum_list)
             args_["pp_deg"] = 1
-            args_["global_tp_deg"] = 1
             args_["global_checkpoint"] = 0
-            batch_size_list = self.get_bsz_list()
-            sequence_length_list = list(product(*self.sequence_length_list))
+            ep_deg = (
+                getattr(self.args, "global_ep_deg", 1)
+                if getattr(self.args, "use_fsep", False)
+                else 1
+            )
+            pp_deg = args_["pp_deg"]
             for bsz in batch_size_list:
                 for seq in sequence_length_list:
-                    PROFILE_ARGS = self.prepare_profile_args(batch_size=bsz)
-                    self.get_seqlen_args(args_, seq)
-                    ARGS_ = self.args2str(args_)
-                    CMD = LAUNCH_SCRIPTS + MODEL_ARGS + PROFILE_ARGS + ARGS_
-                    print(CMD)
-                    os.system(CMD)
+                    tp_deg = 1
+                    while tp_deg <= max_tp_deg:
+                        # Mirror Galvatron's assertion in hybrid_parallel_config.py:
+                        # max_dp_deg = world_size // pp // min(tp*ep, vocab_tp).
+                        # vocab_tp tracks tp_deg when FSEP so the vocab layer isn't
+                        # the bottleneck for the bsz=1 case.
+                        if tp_deg * ep_deg > world_size or world_size % (tp_deg * ep_deg) != 0:
+                            tp_deg *= 2
+                            continue
+                        vocab_tp = tp_deg if getattr(self.args, "use_fsep", False) else 1
+                        min_parallel = min(tp_deg * ep_deg, vocab_tp)
+                        max_dp_deg = world_size // pp_deg // min_parallel
+                        if max_dp_deg == 0 or bsz % max_dp_deg != 0:
+                            print(
+                                f"[skip] bsz={bsz} tp={tp_deg} ep={ep_deg} "
+                                f"vocab_tp={vocab_tp} -> max_dp={max_dp_deg} "
+                                f"incompatible with batch",
+                                flush=True,
+                            )
+                            tp_deg *= 2
+                            continue
+                        args_["vocab_tp"] = vocab_tp
+                        args_["global_tp_deg"] = tp_deg
+                        if getattr(self.args, "use_fsep", False):
+                            args_["global_tp_of_ep_deg"] = tp_deg
+                        # Produce command-line arguments for launching the profiling scripts
+                        PROFILE_ARGS = self.prepare_profile_args(batch_size=bsz)
+                        self.get_seqlen_args(args_, seq)
+                        ARGS_ = self.args2str(args_)
+                        CMD = LAUNCH_SCRIPTS + MODEL_ARGS + PROFILE_ARGS + ARGS_
+                        CMD = self._wrap_with_timeout(CMD)
+                        print(CMD)
+                        # Retrieve and escalate return code from os.system to handle timeouts and failures
+                        rc = os.system(CMD)
+                        self._report_return_code(rc)
+                        tp_deg *= 2
 
     # =============== For Processing Profiled Memory and Time ===============
     def process_profiled_data(self) -> None:
@@ -320,9 +426,9 @@ class ModelProfiler(BaseProfiler):
         _, _, _, world_size, layernum_lists = self.prepare_launch_args()
         args = self.args
 
-        if args.profile_type == "computation":
+        if args.profile_metric == "computation":
             self._process_computation_data(layernum_lists)
-        elif args.profile_type == "memory":
+        elif args.profile_metric == "memory":
             self._process_memory_data(world_size, layernum_lists)
 
     def _process_computation_data(self, layernum_lists: List[List[int]]) -> None:
@@ -337,43 +443,84 @@ class ModelProfiler(BaseProfiler):
         3. Processes results for different batch sizes and sequence lengths
         4. Writes processed results to config file
         """
-        time_config_path = self.time_profiling_path()
-        config = read_json_config(time_config_path)
         batch_size_list = self.get_bsz_list()
         sequence_length_list = list(product(*self.sequence_length_list))
+        # Mirror the launcher's TP sweep so we process every per-(tp,ep) file
+        # the inner sweep actually wrote. Without this, the aggregator reads
+        # only the top-level args' path (global_tp_deg defaults to 1), silently
+        # ignoring tp>1 results.
+        world_size = int(os.getenv("NUM_GPUS_PER_NODE", "1")) * int(
+            os.getenv("NUM_NODES", "1")
+        )
+        max_tp_deg = min(world_size, self.args.max_tp_deg)
+        ep_deg = (
+            getattr(self.args, "global_ep_deg", 1)
+            if getattr(self.args, "use_fsep", False)
+            else 1
+        )
+        tp_values = []
+        tp_deg = 1
+        while tp_deg <= max_tp_deg:
+            if tp_deg * ep_deg <= world_size and world_size % (tp_deg * ep_deg) == 0:
+                tp_values.append(tp_deg)
+            tp_deg *= 2
 
-        for bsz in batch_size_list:
-            for seq in sequence_length_list:
-                # Process base configuration
-                seq_info = num2str(list(seq), "seq")
-                key_base = self.key_format(layernum_lists[0], bsz, seq_info)
-                val_base = config[key_base]
-                total_avg_time = []
+        for tp in tp_values:
+            time_config_path = self.time_profiling_path_for(tp, ep_deg)
+            config = read_json_config(time_config_path)
 
-                # Calculate per-layer computation time for each layer type
-                for idx, layernum in enumerate(layernum_lists[1:]):
-                    key = self.key_format(layernum, bsz, seq_info)
-                    val = config[key]
-                    avg_time = (val - val_base) / bsz / (self.args.layernum_max - self.args.layernum_min)
-                    write_key = f"layertype_{idx}_bsz{bsz}_seq{seq[idx]}"
-                    profile_unit = getattr(self.args, "profile_unit", "all")
-                    if profile_unit != "all":
-                        write_key += f"_{profile_unit}"
-                    config[write_key] = avg_time
-                    total_avg_time.append(avg_time)
-
-                # Calculate other computation overhead (only meaningful for full-layer profiling)
-                if getattr(self.args, "profile_unit", "all") == "all":
-                    other_time = val_base
-                    for idx in range(len(total_avg_time)):
-                        other_time -= layernum_lists[0][idx] * total_avg_time[idx] * bsz
-                    other_time /= bsz
-                    write_key = f"layertype_other_bsz{bsz}_{seq_info}"
-                    config[write_key] = max(other_time, 0)
-
-                # Write results to config file
-                write_json_config(config, time_config_path)
-                print(f"Already written processed computation time into env config file {time_config_path}!\n")
+            for bsz in batch_size_list:
+                for seq in sequence_length_list:
+                    seq_info = num2str(list(seq), "seq")
+                    key_base = self.key_format(layernum_lists[0], bsz, seq_info)
+                    # Inner sweeps skip (bsz, tp) combos where max_dp is
+                    # incompatible with bsz (e.g. tp=2 + bsz=3).
+                    # The corresponding keys never get written, so post-processing
+                    # must skip them rather than KeyError.
+                    if key_base not in config:
+                        continue
+                    val_base = config[key_base]
+                    # Collect derived layertype values into a buffer first
+                    # and only commit them once we have ALL layernums for this bsz.
+                    # If any key is missing (incompatible (bsz, tp) skip
+                    # at the inner sweep), drop the bsz entirely.
+                    pending_writes: list[tuple[str, float]] = []
+                    total_avg_time: list[float] = []
+                    missing = False
+                    for idx, layernum in enumerate(layernum_lists[1:]):
+                        key = self.key_format(layernum, bsz, seq_info)
+                        if key not in config:
+                            missing = True
+                            break
+                        val = config[key]
+                        avg_time = (
+                            (val - val_base)
+                            / bsz
+                            / (self.args.layernum_max - self.args.layernum_min)
+                        )
+                        write_key = f"layertype_{idx}_bsz{bsz}_seq{seq[idx]}"
+                        profile_unit = getattr(self.args, "profile_unit", "all")
+                        if profile_unit != "all":
+                            write_key += f"_{profile_unit}"
+                        pending_writes.append((write_key, avg_time))
+                        total_avg_time.append(avg_time)
+                    if missing:
+                        continue
+                    for _write_key, _write_value in pending_writes:
+                        config[_write_key] = _write_value
+                    # Calculate other computation overhead (only meaningful for full-layer profiling)
+                    if getattr(self.args, "profile_unit", "all") == "all":
+                        other_time = val_base
+                        for idx in range(len(total_avg_time)):
+                            other_time -= layernum_lists[0][idx] * total_avg_time[idx] * bsz
+                        other_time /= bsz
+                        write_key = f"layertype_other_bsz{bsz}_{seq_info}"
+                        config[write_key] = max(other_time, 0)
+                    # Write results to config file
+                    write_json_config(config, time_config_path)
+                    print(
+                        f"Already written processed computation time into env config file {time_config_path}!\n"
+                    )
 
     def _process_memory_data(self, world_size: int, layernum_lists: List[List[int]]) -> None:
         """Process memory profiling data
@@ -398,25 +545,38 @@ class ModelProfiler(BaseProfiler):
             self.args.profile_mode == "static" or self.args.profile_mode == "sequence"
         ), "Memory profiling only support sequence or static profile mode."
 
-        memory_config_path = self.memory_profiling_path()
-        config = read_json_config(memory_config_path)
-
         # Initialize parameters
         bsz = self.args.profile_batch_size
         layernum_list_base = layernum_lists[0]
         layertype = len(layernum_list_base)
-        layernum_lists = layernum_lists[1:]
+        layernum_lists_tail = layernum_lists[1:]
         layernum_diff = self.args.layernum_max - self.args.layernum_min
 
-        # Process each sequence length configuration
-        sequence_length_list = list(product(*self.sequence_length_list))
-        for seq in sequence_length_list:
-            self._process_single_sequence_config(
-                seq, world_size, layernum_list_base, layertype, layernum_lists, layernum_diff, bsz, config
-            )
+        # Mirror the launcher's TP sweep so we process every per-(tp,ep) file
+        # the inner sweep actually wrote. The launcher sweeps tp_deg ∈ 1..max
+        # under a single --global_ep_deg, so walking the same TP values gives
+        # us one file per point.
+        max_tp_deg = min(world_size, self.args.max_tp_deg)
+        if self.args.profile_mode != "static":
+            max_tp_deg = 1
+        ep_deg = getattr(self.args, "global_ep_deg", 1) if getattr(self.args, "use_fsep", False) else 1
+        tp_values = []
+        tp_deg = 1
+        while tp_deg <= max_tp_deg:
+            if tp_deg * ep_deg <= world_size and world_size % (tp_deg * ep_deg) == 0:
+                tp_values.append(tp_deg)
+            tp_deg *= 2
 
-        # Write final results
-        write_json_config(config, memory_config_path)
+        sequence_length_list = list(product(*self.sequence_length_list))
+        for tp in tp_values:
+            memory_config_path = self.memory_profiling_path_for(tp, ep_deg)
+            config = read_json_config(memory_config_path)
+            for seq in sequence_length_list:
+                self._process_single_sequence_config(
+                    seq, world_size, layernum_list_base, layertype, layernum_lists_tail, layernum_diff, bsz, config
+                )
+            write_json_config(config, memory_config_path)
+            print(f"Already written processed memory into env config file {memory_config_path}!\n")
 
     def _process_single_sequence_config(
         self,
@@ -704,7 +864,7 @@ class ModelProfiler(BaseProfiler):
         bsz: Optional[int] = None,
         seq: Optional[Union[str, int]] = None,
         rank: Optional[int] = None,
-        type: Optional[str] = None,
+        memory_type: Optional[str] = None,
     ) -> str:
         """Format key for config dictionary
 
@@ -713,7 +873,7 @@ class ModelProfiler(BaseProfiler):
             bsz: Batch size (optional)
             seq: Sequence length or sequence info string (optional)
             rank: GPU rank (optional)
-            type: Memory type ('ms' for model states or 'act' for activations) (optional)
+            memory_type: Memory type ('ms' for model states or 'act' for activations) (optional)
 
         Returns:
             str: Formatted key string
@@ -737,8 +897,8 @@ class ModelProfiler(BaseProfiler):
         profile_unit = getattr(self.args, "profile_unit", "all")
         if profile_unit != "all":
             s += f"_{profile_unit}"
-        if rank is not None and type is not None:
-            s += f"_rank{rank}_{type}"
+        if rank is not None and memory_type is not None:
+            s += f"_rank{rank}_{memory_type}"
         return s
 
     def total_memcost(
@@ -818,7 +978,8 @@ class ModelProfiler(BaseProfiler):
         assert self.layernum_arg_names is not None
         # Define profiling-specific argument names to exclude
         profile_arg_names = [
-            "profile_type",
+            "profile_metric",
+            "qk_layernorm",
             "set_model_config_manually",
             "set_layernum_manually",
             "set_seqlen_manually",
@@ -851,6 +1012,10 @@ class ModelProfiler(BaseProfiler):
             "seq_length",
             "encoder_seq_length",
             "decoder_seq_length",
+            # These are forwarded explicitly by profiling_general_args() only when set
+            "static_input",
+            "static_input_path",
+            "laer_freeze_after_iter",
         ]
         exclude_arg_names = profile_arg_names + self.layernum_arg_names
         MODEL_ARGS = self.args2str(self.args._get_kwargs(), exclude_arg_names)
@@ -908,8 +1073,14 @@ class ModelProfiler(BaseProfiler):
             val: Argument value
 
         Returns:
-            str: Formatted argument string (e.g., '--key value')
+            str: Formatted argument string (e.g., '--key value').
+            Booleans are rendered as store_true style: '--key' for True, '' for False.
         """
+
+        if isinstance(val, bool):
+            return f" --{key}" if val else ""
+        if val is None:
+            return ""
         return f" --{key} {self.argval2str(val)}"
 
     def args2str(self, args: Union[Dict, List[Tuple]], exclude_args: List[str] = []) -> str:
@@ -950,21 +1121,32 @@ class ModelProfiler(BaseProfiler):
             "set_model_config_manually": 0,
             "set_layernum_manually": 1,
             "set_seqlen_manually": 1,
-            "global_train_batch_size": self.args.profile_batch_size if batch_size is None else batch_size,
+            "global_train_batch_size": (
+                self.args.profile_batch_size if batch_size is None else batch_size
+            ),
             "epochs": 10,
             "lr": 1e-4,
             "adam_weight_decay": 0.01,
-            "dropout_prob": 0.1,
+            "dropout_prob": getattr(self.args, "dropout_prob", 0.1),
             "check_loss": 0,
             "profile": 1,
-            "save_profiled_memory": 1 if self.args.profile_type == "memory" else 0,
-            "profile_forward": 1 if self.args.profile_type == "computation" else 0,
+            "save_profiled_memory": 1 if self.args.profile_metric == "memory" else 0,
+            "profile_forward": 1 if self.args.profile_metric == "computation" else 0,
             "initialize_on_meta": 1,
             "global_tp_consec": 1,
-            "sdp": 1 if self.args.profile_dp_type == "zero3" and self.args.profile_type == "memory" else 0,
+            "sdp": (
+                1
+                if self.args.profile_dp_type == "zero3"
+                and self.args.profile_metric == "memory"
+                else 0
+            ),
             "chunks": 1,
             "pipeline_type": "gpipe",
-            "default_dp_type": self.args.profile_dp_type if self.args.profile_type == "memory" else "ddp",
+            "default_dp_type": (
+                self.args.profile_dp_type
+                if self.args.profile_metric == "memory"
+                else "ddp"
+            ),
             "mixed_precision": self.args.mixed_precision,
             "shape_order": self.args.shape_order,
         }
@@ -974,6 +1156,26 @@ class ModelProfiler(BaseProfiler):
             args["use-flash-attn"] = ""
         if self.args.sequence_parallel:
             args["sequence-parallel"] = ""
+        # Forward frozen-input / solver-freeze knobs to the launched runtime.
+        if getattr(self.args, "use_fsep", False):
+            args["use_fsep"] = ""
+            # FSEP requires ep_size * expert_capacity_per_device >= num_global_experts.
+            # Forward whatever was set on the profiler CLI; otherwise the trainer
+            # defaults (ep=1, capacity=1) will break for models with >1 expert.
+            if getattr(self.args, "global_ep_deg", None) is not None:
+                args["global_ep_deg"] = self.args.global_ep_deg
+            if getattr(self.args, "global_tp_of_ep_deg", None) is not None:
+                args["global_tp_of_ep_deg"] = self.args.global_tp_of_ep_deg
+            if getattr(self.args, "expert_capacity_per_device", None) is not None:
+                args["expert_capacity_per_device"] = (
+                    self.args.expert_capacity_per_device
+                )
+        if getattr(self.args, "static_input", False):
+            args["static_input"] = ""
+        if getattr(self.args, "static_input_path", ""):
+            args["static_input_path"] = self.args.static_input_path
+        if getattr(self.args, "laer_freeze_after_iter", -1) != -1:
+            args["laer_freeze_after_iter"] = self.args.laer_freeze_after_iter
         return args
 
     def get_layernum_args(self, args: Dict[str, Any], layernum_list: List[int]) -> None:
@@ -1016,7 +1218,7 @@ class ModelProfiler(BaseProfiler):
         # Swin model does not support set seqlen manually
         if self.seqlen_arg_names is None:
             return
-        
+
         for seqlen, arg_name in zip(seqlen_list, self.seqlen_arg_names):
             args[arg_name] = seqlen
 
@@ -1033,10 +1235,20 @@ class ModelProfiler(BaseProfiler):
                 - NCCL settings
         """
         return {
-            "PROFILE_LAUNCHER": os.getenv("PROFILE_LAUNCHER", "python3 -m torch.distributed.launch"),
+            "PROFILE_LAUNCHER": os.getenv(
+                "PROFILE_LAUNCHER", "python3 -m torch.distributed.launch"
+            ),
             "PROFILE_TRAINER": os.getenv("PROFILE_TRAINER", "train_dist.py"),
-            "NUM_NODES": os.getenv("NUM_NODES", "1") if self.args.profile_type == "memory" else "1",
-            "NUM_GPUS_PER_NODE": os.getenv("NUM_GPUS_PER_NODE", "8") if self.args.profile_type == "memory" else "1",
+            "NUM_NODES": (
+                os.getenv("NUM_NODES", "1")
+                if self.args.profile_metric == "memory"
+                else "1"
+            ),
+            "NUM_GPUS_PER_NODE": (
+                os.getenv("NUM_GPUS_PER_NODE", "8")
+                if self.args.profile_metric == "memory"
+                else "1"
+            ),
             "MASTER_ADDR": os.getenv("MASTER_ADDR", ""),
             "MASTER_PORT": os.getenv("MASTER_PORT", ""),
             "NCCL_SOCKET_IFNAME": os.getenv("NCCL_SOCKET_IFNAME", ""),

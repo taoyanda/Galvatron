@@ -1,3 +1,4 @@
+import os
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -153,7 +154,12 @@ def fake_tensor(bsz):
 # reused thereafter. Raw batch tensors + rotary embedding are cached; the
 # chunked micro_lossmask must be rebuilt per call because loss_func pops from
 # it.
-_static_batch_cache = {"cached": False, "batch": None, "rotary_embedding": None}
+_static_batch_cache = {
+    "cached": False,
+    "batch": None,
+    "rotary_embedding": None,
+    "hits": 0,
+}
 
 
 def _build_static_synthetic_batch(args, batch_size):
@@ -225,8 +231,51 @@ def get_batch(data_iterator):
 
     if static_input:
         if not _static_batch_cache["cached"]:
-            batch = _build_static_synthetic_batch(args, batch_size)
-            _broadcast_batch_across_dp(batch)
+            static_path = getattr(args, "static_input_path", "") or ""
+            batch = None
+            source = None
+            if static_path and os.path.isfile(static_path):
+                device = torch.cuda.current_device()
+                loaded = torch.load(static_path, map_location="cpu")
+                batch = {
+                    k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                    for k, v in loaded.items()
+                }
+                assert batch["tokens"].shape[0] == batch_size, (
+                    f"static_input file {static_path} has batch_size "
+                    f"{batch['tokens'].shape[0]}, expected {batch_size}"
+                )
+                assert batch["tokens"].shape[1] == args.seq_length, (
+                    f"static_input file {static_path} has seq_length "
+                    f"{batch['tokens'].shape[1]}, expected {args.seq_length}"
+                )
+                source = f"loaded from {static_path}"
+            if batch is None:
+                batch = _build_static_synthetic_batch(args, batch_size)
+                _broadcast_batch_across_dp(batch)
+                if static_path and torch.distributed.get_rank() == 0:
+                    os.makedirs(
+                        os.path.dirname(os.path.abspath(static_path)), exist_ok=True
+                    )
+                    torch.save(
+                        {
+                            k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+                            for k, v in batch.items()
+                        },
+                        static_path,
+                    )
+                source = f"built from seed={getattr(args, 'seed', 1234)}" + (
+                    f", saved to {static_path}" if static_path else ""
+                )
+            if torch.distributed.get_rank() == 0:
+                tok = batch["tokens"]
+                print(
+                    f"[static_input] FIRST-BATCH {source} | "
+                    f"tokens.shape={tuple(tok.shape)} dtype={tok.dtype} "
+                    f"sum={tok.sum().item()} first8={tok.flatten()[:8].tolist()} "
+                    f"attention_mask={'None' if batch['attention_mask'] is None else tuple(batch['attention_mask'].shape)}",
+                    flush=True,
+                )
             rotary_pos_emb = RotaryEmbedding(
                 args.hidden_size // args.num_attention_heads,
                 args.rotary_percent,
@@ -239,6 +288,16 @@ def get_batch(data_iterator):
             _static_batch_cache["rotary_embedding"] = rotary_embedding
         batch = _static_batch_cache["batch"]
         rotary_embedding = _static_batch_cache["rotary_embedding"]
+        _static_batch_cache["hits"] += 1
+        if torch.distributed.get_rank() == 0:
+            hits = _static_batch_cache["hits"]
+            if hits <= 3 or hits % 10 == 0:
+                tok = batch["tokens"]
+                print(
+                    f"[static_input] CACHE-HIT #{hits} "
+                    f"tokens.sum={tok.sum().item()} first4={tok.flatten()[:4].tolist()}",
+                    flush=True,
+                )
         micro_lossmask = chunk_batch([batch["loss_mask"]], get_chunks(args))
         return (
             batch["tokens"],

@@ -51,15 +51,16 @@ LAYERNUM_MAX=4
 # Batch-size sweep for the MLP pass (the one LAER consumes and the one that
 # benefits most from a full curve for pp planning).
 BSZ_MIN=1
-BSZ_MAX=12
+BSZ_MAX=1
 BSZ_STEP=1
 
 COMMON_PROFILE_ARGS="
     --profile_mode batch \
-    --profile_type computation \
+    --profile_metric computation \
     --profile_min_batch_size ${BSZ_MIN} \
     --profile_max_batch_size ${BSZ_MAX} \
     --profile_batch_size_step ${BSZ_STEP} \
+    --profile_seq_length_list 4096 \
     --layernum_min ${LAYERNUM_MIN} \
     --layernum_max ${LAYERNUM_MAX} \
     --mixed_precision bf16 \

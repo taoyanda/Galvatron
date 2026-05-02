@@ -285,7 +285,11 @@ class RuntimeProfiler(BaseProfiler):
 
     def _process_time_results(self) -> None:
         """Process and save time profiling results"""
-        avg_time = sum(self.time_list[10:]) / (len(self.time_list) - 10)
+        # time_list already only contains iters in [start_iter, end_iter);
+        # warmup has been filtered by profile_time_end's gate, so average
+        # over all samples here instead of double-skipping another 10.
+        assert len(self.time_list) > 0, "No timing samples collected"
+        avg_time = sum(self.time_list) / len(self.time_list)
         print(f"Average iteration time is: {avg_time:.4f} s")
 
         args = self.args

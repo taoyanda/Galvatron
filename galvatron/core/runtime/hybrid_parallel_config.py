@@ -89,10 +89,19 @@ def get_hybrid_parallel_configs_api(config, args, model_info):
         pp_divide = [avg_layer_num] * (pp_deg - 1) + [last_layer_num]
     pp_ranks_enc = get_pp_ranks_enc(pp_divide)
 
-    min_tp = min(min(tp_sizes_enc), args.vocab_tp)
-    assert (
-        args.global_train_batch_size % (world_size // pp_deg // min_tp) == 0
-    ), "global_train_batch_size should be multiple of world_size//pp_deg!"
+    # Effective DP group size is bounded by the layer with the SMALLEST parallel
+    # product (tp * ep). Vocab layer has no expert parallelism so it's just vocab_tp.
+    # Using more TP/EP shrinks DP, which loosens the bsz constraint — the original
+    # formula ignored ep and was too strict for FSEP runs.
+    per_layer_parallel = [t * e for t, e in zip(tp_sizes_enc, ep_sizes_enc)] + [
+        args.vocab_tp
+    ]
+    min_parallel = min(per_layer_parallel)
+    max_dp_deg = world_size // pp_deg // min_parallel
+    assert args.global_train_batch_size % max_dp_deg == 0, (
+        f"global_train_batch_size ({args.global_train_batch_size}) should be multiple of "
+        f"world_size({world_size})//pp_deg({pp_deg})//min(tp*ep,vocab_tp)({min_parallel}) = {max_dp_deg}."
+    )
     hybrid_parallel_configs = {
         "is_moe_model": args.is_moe_model,
         "pp_deg": pp_deg,

@@ -144,6 +144,19 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
         self._static_ref_counts = None
         self._static_check_count = 0
         self._static_check_budget = 20
+        # One-time startup log so we can confirm the solver is enabled and the
+        # freeze knob was wired through. Layer 0 only to avoid N-layer spam.
+        if self.layer_number == 0 and torch.distributed.get_rank() == 0:
+            cfg = self.async_lp_solver_config
+            print(
+                f"[solver_init] enabled={cfg['enabled']} "
+                f"freeze_after_iter={cfg['freeze_after_iter']} "
+                f"hidden_size={cfg['hidden_size']} "
+                f"expert_capacity_per_device={cfg['expert_capacity_per_device']} "
+                f"comp_cfg={cfg['computation_config_path']} "
+                f"net_cfg={cfg['network_config_path']}",
+                flush=True,
+            )
 
     def get_smart_routing(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
@@ -252,6 +265,10 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
 
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).int()
+        # The `if self.ep_size > 1 or self.tp_size > 1:` branch below assigns
+        # `new_routing_map`/`new_probs`, but the else branch doesn't. For
+        # tp=1 ep=1 (single-process MoE) we still need to return them.
+        new_routing_map, new_probs = routing_map, probs
 
         if self.config.moe_expert_capacity_factor is not None:
             # Drop tokens to capacity, no padding.
@@ -539,7 +556,7 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
 
         return output, None
     
-    def sync_lp_solver(self):
+    def sync_lp_solver(self, debug: bool=True):
         """
         Sync LP solver after forward pass. If --laer_freeze_after_iter has been
         reached, stop submitting new solver tasks and let the last placement
@@ -559,6 +576,17 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
             return
         self.cuda_dtoh_stream.synchronize()
         self.solver_iter += 1
+        if debug and torch.distributed.get_rank() == 0 and (self.solver_iter <= 3 or self.solver_iter % 5 == 0):
+            hist = self.total_num_global_tokens_per_expert
+            try:
+                hist_sum = int(np.asarray(hist).sum())
+            except Exception:
+                hist_sum = -1
+            print(
+                f"[solver_submit] layer={self.layer_number} iter={self.solver_iter} "
+                f"hist_tokens_sum={hist_sum}",
+                flush=True,
+            )
         self.async_lp_task_id = submit_lp_optimization(
             history_data=self.total_num_global_tokens_per_expert,
             layer_number=self.layer_number,
@@ -634,7 +662,7 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
                 self._process_lp_result(result)
                 self.async_lp_task_id = None
 
-    def _process_lp_result(self, result):
+    def _process_lp_result(self, result, debug:bool=True):
         """Process linear programming optimization result"""
         if result.get("status") == "success":
             # Here optimization results can be applied to routing strategy
@@ -643,6 +671,21 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
             new_placement_numpy = result.get("expert_placement_numpy")
             # Layout-change diagnostic: only meaningful before freeze, since no
             # further solver tasks will be submitted afterward.
+
+            if debug and torch.distributed.get_rank() == 0 :
+                p_array = np.asarray(new_placement_numpy) if new_placement_numpy is not None else None
+                try:
+                    p_sum = int(p_array.sum())
+                    p_shape = tuple(p_array.shape)
+                except Exception:
+                    p_sum, p_shape = -1, None
+                if self.solver_iter <= 3 or self.solver_iter % 5 == 0:
+                    print(
+                        f"[solver_result] layer={self.layer_number} iter={self.solver_iter} "
+                        f"placement_shape={p_shape} placement_sum={p_sum}",
+                        flush=True,
+                    )
+
             if not self._freeze_logged and new_placement_numpy is not None:
                 if self._prev_placement_numpy is not None:
                     try:

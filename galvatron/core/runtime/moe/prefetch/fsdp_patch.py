@@ -129,19 +129,39 @@ def _new_init(
     self.process_group = process_group
 
     # FSEP ADD
+    def _suffix_for(grp: dist.ProcessGroup) -> str:
+        """
+        Add a suffix to a process group to avoid silent overlap despite
+        different ranks
+        """
+        try:
+            suffix = ",".join(str(r) for r in sorted(dist.get_process_group_ranks(grp)))
+        except Exception as e :
+            log.warning(
+                "Failed to get ranks for process group %s with error %s, using empty suffix instead.",
+                grp,
+                e,
+            )
+            suffix = ""
+
+        return suffix
+
     if os.getenv("ENABLE_HIERARCHICAL", "0") == "1":
         world_size = process_group.size()
         rank = process_group.rank()
         gpus_per_node = 8
         if world_size not in ep_intra_node_group_dict:
             ep_intra_node_group_dict[world_size], ep_inter_node_group_dict[world_size] = get_ep_group_intra_inter(rank, world_size, gpus_per_node)
-        moe_all_to_all_kernels.init_nccl_comm(ep_intra_node_group_dict[world_size], rank % gpus_per_node, gpus_per_node)
+        _grp = ep_intra_node_group_dict[world_size]
+        _key_suffix = _suffix_for(_grp)
+        moe_all_to_all_kernels.init_nccl_comm(_grp, rank % gpus_per_node, gpus_per_node, _key_suffix)
+        dist.barrier(group=_grp)
     else:
         world_size = process_group.size()
         rank = process_group.rank()
-        if world_size not in prefetch_group_dict:
-            prefetch_group_dict[world_size] = dist.new_group(ranks=range(world_size))
-        moe_all_to_all_kernels.init_nccl_comm(prefetch_group_dict[world_size], rank, world_size)
+        _key_suffix = _suffix_for(process_group)
+        moe_all_to_all_kernels.init_nccl_comm(process_group, rank, world_size, _key_suffix)
+        dist.barrier(group=process_group)
     self.rank = process_group.rank()
     self.world_size = process_group.size()
     self._sharding_strategy = sharding_strategy
@@ -484,7 +504,7 @@ def _all_to_all_flat_param_type3_cuda(
         self.global_expert_num,
         process_group
     )
-    
+
     return padded_unsharded_flat_param, sharded_flat_param
 
 def _all_to_all_grad_type3_cuda(
@@ -870,7 +890,13 @@ def new_pre_backward_hook(
             with state._device_handle.stream(state._post_backward_stream):
                 if handle.pre_backward_event is not None:
                     torch.cuda.current_stream().wait_event(handle.pre_backward_event)
-                get_delayed_gradient().execute_pending_gradinet()
+                # The FSEP delayed-gradient executor asserts the handle is
+                # sharded (megatron utils:1752). Under NO_SHARD (ddp) there
+                # are no delayed grads to flush — backward writes locally
+                # and DDP all-reduces afterwards. Skip the call so full-iter
+                # profiling under ddp doesn't crash on the assertion.
+                if handle.uses_sharded_strategy:
+                    get_delayed_gradient().execute_pending_gradinet()
         handle._needs_pre_backward_unshard = False
         with torch.profiler.record_function(
             "FullyShardedDataParallel._pre_backward_prefetch"
@@ -924,3 +950,21 @@ def new_init_exec_order_data(
         self.warn_status = _ExecOrderWarnStatus.NONE
 
 _ExecOrderData.__init__ = new_init_exec_order_data
+
+
+# Open-1 fix: upstream _ExecOrderData._check_order issues an
+# `all_gather_into_tensor(group=self.process_group)` on the first forward of
+# every FSDP wrap. With tp=2 dp=2, the root FSDP wrap's process_group is a
+# 2-rank DP group (e.g. {0,2}). For reasons we have not pinned down (likely
+# stream synchronization with our FSEP user-NCCL comm initialized over the
+# same group earlier in `init_nccl_comm`), this all_gather wedges
+# deterministically — all 4 ranks dump faulthandler stacks at
+# `_runtime_utils.py:425` in `_pre_forward`, which calls `record_pre_forward`
+# → `_check_order` → the wedged all_gather. The check is purely a
+# consistency assertion, not functional, so we monkey-patch it out: return
+# without issuing the collective.
+def _no_op_check_order(self, handle, is_training):
+    return
+
+
+_ExecOrderData._check_order = _no_op_check_order

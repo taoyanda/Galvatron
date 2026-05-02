@@ -1,23 +1,15 @@
+from galvatron.core.common_args import galvatron_common_model_args
+
+
 def galvatron_training_args(parser, use_megatron=True):
+    galvatron_common_model_args(parser)
     group = parser.add_argument_group(title="Galvatron Training Arguments")
 
-    group.add_argument(
-        "--set_model_config_manually",
-        type=int,
-        default=0,
-        help="Whether to set model config manually. If set to 1, model config set by 'model_size' will be overwritten.",
-    )
     group.add_argument(
         "--set_layernum_manually",
         type=int,
         default=0,
         help="Whether to set layernum config manually (doesn't overwrite other model configs).",
-    )
-    group.add_argument(
-        "--set_seqlen_manually",
-        type=int,
-        default=0,
-        help="Whether to set sequence length config manually (doesn't overwrite other model configs).",
     )
     group.add_argument(
         "--initialize_on_meta",
@@ -26,13 +18,29 @@ def galvatron_training_args(parser, use_megatron=True):
         help="Whether to initialize parameters on meta device.",
         choices=[0, 1],
     )
-    group.add_argument("--global_train_batch_size", type=int, default=32, help="Global training batch size")
-    group.add_argument("--dropout_prob", type=float, default=0.1, help="Dropout rate.")
+    group.add_argument(
+        "--global_train_batch_size",
+        type=int,
+        default=32,
+        help="Global training batch size",
+    )
+    # --dropout_prob moved to galvatron_common_model_args.
     group.add_argument("-e", "--epochs", type=int, default=10, help="Number of epochs")
-    group.add_argument("--adam_weight_decay", type=float, default=0.01, help="Weight_decay of adam")
-    group.add_argument("--check_loss", type=int, default=0, help="Whether to check model correctness.")
-    group.add_argument("--profile", type=int, default=0, help="Whether to profile model GPU memory.")
-    group.add_argument("--save_profiled_memory", type=int, default=0, help="Whether to save profiled memory.")
+    group.add_argument(
+        "--adam_weight_decay", type=float, default=0.01, help="Weight_decay of adam"
+    )
+    group.add_argument(
+        "--check_loss", type=int, default=0, help="Whether to check model correctness."
+    )
+    group.add_argument(
+        "--profile", type=int, default=0, help="Whether to profile model GPU memory."
+    )
+    group.add_argument(
+        "--save_profiled_memory",
+        type=int,
+        default=0,
+        help="Whether to save profiled memory.",
+    )
     group.add_argument(
         "--profile_type",
         type=str,
@@ -41,13 +49,14 @@ def galvatron_training_args(parser, use_megatron=True):
         choices=["allocated", "reserved"],
     )
     group.add_argument(
-        "--profile_mode",
-        type=str,
-        default="static",
-        help="Galvatron profiling mode",
-        choices=["static", "batch", "sequence"],
+        "--load_params", type=int, default=0, help="Whether to load saved init params."
     )
-    group.add_argument("--load_params", type=int, default=0, help="Whether to load saved init params.")
+    group.add_argument(
+        "--profile_unit",
+        choices=["attention", "mlp", "all"],
+        default="all",
+        help="Profile granularity. Consumed by MoE model when running under the profiler.",
+    )
     group.add_argument(
         "--pp_deg",
         type=int,
@@ -69,7 +78,10 @@ def galvatron_training_args(parser, use_megatron=True):
         help="Pipeline chunk num.",
     )
     group.add_argument(
-        "--global_tp_consec", type=int, default=-1, help="Global tensor parallel group consecutive flag."
+        "--global_tp_consec",
+        type=int,
+        default=-1,
+        help="Global tensor parallel group consecutive flag.",
     )
     group.add_argument(
         "--sdp",
@@ -84,13 +96,8 @@ def galvatron_training_args(parser, use_megatron=True):
         default=None,
         help="Galvatron strategy config path. If not None, galvatron will run according to json config file.",
     )
-    group.add_argument("--global_checkpoint", type=int, default=0, help="Global checkpoint flag.")
     group.add_argument(
-        "--mixed_precision",
-        type=str,
-        default="bf16",
-        help="Mixed precision option.",
-        choices=["fp32", "fp16", "bf16"],
+        "--global_checkpoint", type=int, default=0, help="Global checkpoint flag."
     )
     group.add_argument(
         "--pipeline_type",
@@ -135,13 +142,6 @@ def galvatron_training_args(parser, use_megatron=True):
         choices=[0, 1],
     )
     group.add_argument(
-        "--shape_order",
-        type=str,
-        default="SBH",
-        help="Model shape order.",
-        choices=["SBH", "BSH"],
-    )
-    group.add_argument(
         "--vocab_tp",
         type=int,
         default=1,
@@ -183,10 +183,17 @@ def galvatron_training_args(parser, use_megatron=True):
         help="Load iteration number.",
     )
     if not use_megatron:
-        group.add_argument("--lr", type=float, default=1e-4, help="Learning rate of adam")
+        group.add_argument(
+            "--lr", type=float, default=1e-4, help="Learning rate of adam"
+        )
         group.add_argument("--gpu_id", type=int, default=0, help="Id of GPU to run.")
     else:
-        group.add_argument("--no-shared-storage", action="store_false", dest="shared_storage", help="Cluster is not shared storage.")
+        group.add_argument(
+            "--no-shared-storage",
+            action="store_false",
+            dest="shared_storage",
+            help="Cluster is not shared storage.",
+        )
 
     # MoE arguments
     group.add_argument(
@@ -200,62 +207,17 @@ def galvatron_training_args(parser, use_megatron=True):
         default=0,
         help="Whether to set experts config manually (doesn't overwrite other model configs).",
     )
-    group.add_argument(
-        "--global_ep_deg",
-        type=int,
-        default=1,
-        help="Experts parallel degree.",
-    )
-
-    group.add_argument(
-        "--global_tp_of_ep_deg",
-        type=int,
-        default=1,
-        help="Tensor parallel degree of experts.",
-    )
-
-    group.add_argument(
-        "--use_fsep",
-        action="store_true",
-        help="Whether to use fsep.",
-    )
-
-    group.add_argument(
-        "--profile_unit",
-        choices=["attention", "mlp", "all"],
-        default="all",
-        help="Profile granularity",
-    )
-
-    group.add_argument(
-        "--expert_capacity_per_device",
-        type=int,
-        default=1,
-        help="Expert capacity per device.",
-    )
+    # --global_ep_deg / --global_tp_of_ep_deg / --use_fsep / --expert_capacity_per_device
+    # moved to galvatron_common_model_args so profiler CLI accepts them too.
 
     group.add_argument(
         "--recompute_communication",
         action="store_true",
         help="Whether to recompute communication.",
     )
-    # PP-profiling / deterministic-benchmarking knobs (see PP_PROFILING_PLAN.md)
-    group.add_argument(
-        "--static_input",
-        action="store_true",
-        help="Reuse a single deterministic batch across all training iterations. "
-        "The batch is built once on rank 0 and broadcast across the DP group. "
-        "Intended for PP cost-model profiling under a frozen LAER layout. "
-        "Combine with --dropout_prob 0 to keep routing bit-identical across iters.",
-    )
-    group.add_argument(
-        "--laer_freeze_after_iter",
-        type=int,
-        default=-1,
-        help="Freeze the LAER expert layout once each dispatcher has submitted this many "
-        "solver iterations. -1 disables freezing (default). Only meaningful when "
-        "ENABLE_SOLVER=1.",
-    )
+    # --static_input / --static_input_path / --laer_freeze_after_iter moved to
+    # galvatron_common_model_args so they are accepted by both training and
+    # profiling entry points.
     group.add_argument(
         "--moe_computation_config_path",
         type=str,

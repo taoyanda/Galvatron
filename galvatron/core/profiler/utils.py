@@ -19,6 +19,30 @@ def print_peak_memory(prefix, device, type="allocated"):
     return max_mem, cur_mem
 
 
+def _is_distributed():
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _is_rank0():
+    return (not _is_distributed()) or torch.distributed.get_rank() == 0
+
+
+def _allreduce_max(value):
+    """Collapse a scalar across ranks using MAX to get the conservative result.
+    Fixes the multi-rank read-modify-write race on the shared JSON file.
+    """
+    if not _is_distributed():
+        return value
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    t = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+    return t.item()
+
+
 def save_profiled_memory(
     path,
     pp_deg,
@@ -36,6 +60,15 @@ def save_profiled_memory(
     seq=None,
     profile_unit="all",
 ):
+    # All ranks participate in the reduction; only rank 0 writes the file.
+    # Keys retain the rank index for backward compatibility with the memory
+    # aggregator, but every rank's key stores the same (conservative MAX)
+    # value since ranks have been collapsed via all_reduce.
+    model_states = _allreduce_max(model_states)
+    activation = _allreduce_max(activation)
+    activation_peak = _allreduce_max(activation_peak)
+    if not _is_rank0():
+        return
     config = read_json_config(path) if os.path.exists(path) else {}
     key = "%d_%d_%d" % (pp_deg, tp_deg, world_size // pp_deg // tp_deg)
     if cpt:
@@ -48,19 +81,41 @@ def save_profiled_memory(
         config[key] = {}
     layernum_info = num2str(layer_num, "layernum")
     seq_info = num2str(seq, "seq")
-    if profile_unit == "all":
-        config[key]["%s_bsz%d_%s_rank%d_ms" % (layernum_info, bsz, seq_info, rank)] = model_states
-        config[key]["%s_bsz%d_%s_rank%d_act" % (layernum_info, bsz, seq_info, rank)] = activation
-        config[key]["%s_bsz%d_%s_rank%d_act_peak" % (layernum_info, bsz, seq_info, rank)] = activation_peak
-    else:
-        config[key]["%s_bsz%d_%s_%s_rank%d_ms" % (layernum_info, bsz, seq_info, profile_unit, rank)] = model_states
-        config[key]["%s_bsz%d_%s_%s_rank%d_act" % (layernum_info, bsz, seq_info, profile_unit, rank)] = activation
-        config[key]["%s_bsz%d_%s_%s_rank%d_act_peak" % (layernum_info, bsz, seq_info, profile_unit, rank)] = activation_peak
+    # Write both first-stage (rank 0) and last-stage (rank world_size-1) keys
+    # so the PP-aware aggregator in _process_memory_data finds both indices.
+    ranks_to_write = {0, max(0, world_size - 1)}
+    for r in ranks_to_write:
+        if profile_unit == "all":
+            config[key][
+                "%s_bsz%d_%s_rank%d_ms" % (layernum_info, bsz, seq_info, r)
+            ] = model_states
+            config[key][
+                "%s_bsz%d_%s_rank%d_act" % (layernum_info, bsz, seq_info, r)
+            ] = activation
+            config[key][
+                "%s_bsz%d_%s_rank%d_act_peak" % (layernum_info, bsz, seq_info, r)
+            ] = activation_peak
+        else:
+            config[key][
+                "%s_bsz%d_%s_%s_rank%d_ms"
+                % (layernum_info, bsz, seq_info, profile_unit, r)
+            ] = model_states
+            config[key][
+                "%s_bsz%d_%s_%s_rank%d_act"
+                % (layernum_info, bsz, seq_info, profile_unit, r)
+            ] = activation
+            config[key][
+                "%s_bsz%d_%s_%s_rank%d_act_peak"
+                % (layernum_info, bsz, seq_info, profile_unit, r)
+            ] = activation_peak
     write_json_config(config, path)
     print("Already written profiled memory into config file %s!\n" % (path))
 
 
 def save_profiled_time(path, time, bsz, layer_num, seq, profile_unit):
+    time = _allreduce_max(time)
+    if not _is_rank0():
+        return
     config = read_json_config(path) if os.path.exists(path) else {}
     layernum_info = num2str(layer_num, "layernum")
     seq_info = num2str(seq, "seq")

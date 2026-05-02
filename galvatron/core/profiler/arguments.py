@@ -1,14 +1,22 @@
+from galvatron.core.common_args import galvatron_common_model_args
+
+
 def galvatron_profile_args(parser):
+    galvatron_common_model_args(parser)
     group = parser.add_argument_group(title="Galvatron Profiling Arguments")
 
     group.add_argument(
-        "--profile_type", type=str, default="memory", help="Galvatron profiling type", choices=["memory", "computation"]
+        "--profile_unit",
+        choices=["attention", "mlp", "all"],
+        default="all",
+        help="Profile granularity",
     )
     group.add_argument(
-        "--set_model_config_manually",
-        type=int,
-        default=0,
-        help="Whether to set model config manually. If set to 1, model config set by 'model_size' will be overwritten.",
+        "--profile_metric",
+        type=str,
+        default="memory",
+        help="Galvatron profiling metric (which pass the driver runs).",
+        choices=["memory", "computation"],
     )
     group.add_argument(
         "--set_layernum_manually",
@@ -17,17 +25,10 @@ def galvatron_profile_args(parser):
         help="Whether to set layernum config manually (doesn't overwrite other model configs).",
     )
     group.add_argument(
-        "--set_seqlen_manually",
+        "--set_experts_manually",
         type=int,
         default=0,
-        help="Whether to set sequence length config manually (doesn't overwrite other model configs).",
-    )
-    group.add_argument(
-        "--profile_mode",
-        type=str,
-        default="static",
-        help="Galvatron profiling mode",
-        choices=["static", "batch", "sequence"],
+        help="Whether to set experts config manually (doesn't overwrite other model configs).",
     )
     group.add_argument("--profile_batch_size", type=int, default=None, help="Galvatron profiling batch size")
     group.add_argument("--profile_min_batch_size", type=int, default=None, help="Galvatron profiling min batch size")
@@ -51,13 +52,6 @@ def galvatron_profile_args(parser):
     group.add_argument(
         "--profile_dp_type", type=str, default="zero3", help="Use zero3 or ddp to profile.", choices=["zero3", "ddp"]
     )
-    group.add_argument(
-        "--mixed_precision",
-        type=str,
-        default="bf16",
-        help="Mixed precision option.",
-        choices=["fp32", "fp16", "bf16"],
-    )
     group.add_argument("--use-flash-attn", action="store_true", help="Use FlashAttention implementation of attention.")
     group.add_argument("--extra_args_str", type=str, default="", help="Extra arguments for megatron initilization.")
 
@@ -65,14 +59,6 @@ def galvatron_profile_args(parser):
         "--sequence_parallel",
         action="store_true",
         help="Whether to use sequence parallel",
-    )
-
-    group.add_argument(
-        "--shape_order",
-        type=str,
-        default="SBH",
-        help="Model shape order.",
-        choices=["SBH", "BSH"],
     )
 
     group.add_argument(

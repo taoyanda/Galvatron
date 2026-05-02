@@ -116,7 +116,7 @@ class Attention(MegatronModule, ABC):
         self.attention_type = attention_type
         self.use_flash_attn = args.use_flash_attn
         self.sequence_parallel = config.sequence_parallel
-        
+
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
@@ -161,7 +161,7 @@ class Attention(MegatronModule, ABC):
                 causal=(attn_mask_type == AttnMaskType.causal),
                 attention_dropout=config.attention_dropout,
             )
-        
+
         if self.use_ulysses:
             assert self.config.num_query_groups % sp_world_size == 0
             self.dist_attn = build_module(
@@ -635,6 +635,12 @@ class Attention(MegatronModule, ABC):
             if q_pos_emb is not None:
                 # TODO VIJAY: simplify
                 if inference_context is None or inference_context.is_static_batching():
+                    if torch.distributed.get_rank() == 0:
+                        print(
+                            f"[rope] query={tuple(query.shape)} "
+                            f"q_pos_emb={tuple(q_pos_emb.shape)}",
+                            flush=True,
+                        )
                     query = apply_rotary_pos_emb(
                         query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
                     )
