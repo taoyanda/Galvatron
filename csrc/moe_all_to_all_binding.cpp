@@ -15,29 +15,59 @@ ncclComm_t nccl_comm;
 
 class HackNCCLGroup: public c10d::ProcessGroupNCCL {
     public:
-        // TODO: create different comms for different world_size?
-        ncclComm_t getcomm(int rank, int world_size) {
+        // The storeKey is shared across the c10d Store, which is global to the
+        // whole world. If multiple disjoint groups (e.g. {0,2} and {1,3}) hit
+        // this concurrently with the same fixed key, their `set`/`get` calls
+        // race on the same store entry, silently swapping NCCL IDs between
+        // groups. ncclCommInitRank then succeeds with a corrupted ID, leading
+        // to a hang on the first real send/recv. Disambiguate the key with a
+        // caller-supplied suffix (e.g. sorted group ranks) so each group gets
+        // its own slot in the store.
+        ncclComm_t getcomm(int rank, int world_size, const std::string& key_suffix) {
             ncclUniqueId ncclID;
             if (rank == 0) {
                 ncclGetUniqueId(&ncclID);
             }
+            std::string key = "prefetch_all_to_all_comm";
+            if (!key_suffix.empty()) {
+                key += ":" + key_suffix;
+            }
             broadcastUniqueNCCLID(&ncclID,
                 false,
-                "prefetch_all_to_all_comm",
+                key,
                 rank);
             ncclCommInitRank(&nccl_comm, world_size, ncclID, rank);
             return nccl_comm;
         }
 };
 
-void init_nccl_comm(c10d::ProcessGroup& p, int rank, int world_size) {
+void init_nccl_comm(c10d::ProcessGroup& p, int rank, int world_size, const std::string& key_suffix) {
     if (is_initialized) {
         return;
     }
     HackNCCLGroup* h = (HackNCCLGroup*)(void*)
         (p.getBackend(c10d::ProcessGroup::NCCL).get());
-    nccl_comm = h->getcomm(rank, world_size);
+    nccl_comm = h->getcomm(rank, world_size, key_suffix);
     is_initialized = true;
+}
+
+// Tear down the user-NCCL communicator. Called from Python's atexit/SIGTERM
+// handler in train_dist_random.py so a clean shutdown returns CUDA driver
+// state to the OS, avoiding the ~10 min "device busy" window on the next
+// torchrun launch (see doc/profile_computation_frozen_fixes.md, Open 2).
+void destroy_nccl_comm() {
+    if (!is_initialized) {
+        return;
+    }
+    // ncclCommDestroy waits for outstanding ops on the comm; if those are
+    // wedged this can itself hang. The caller is expected to have already
+    // SIGTERM'd / drained training. Errors are swallowed here because we
+    // are best-effort during shutdown.
+    ncclResult_t r = ncclCommDestroy(nccl_comm);
+    if (r != ncclSuccess) {
+        fprintf(stderr, "[moe_all_to_all_kernels] ncclCommDestroy: %d\n", r);
+    }
+    is_initialized = false;
 }
 
 extern "C" bool moe_nccl_forward_tensor(
@@ -204,9 +234,13 @@ void hierarchical_moe_nccl_backward(
 PYBIND11_MODULE(moe_all_to_all_kernels, m) {
     m.doc() = "Optimized MoE All-to-All kernels using CUDA and NCCL";
 
-    m.def("init_nccl_comm", &init_nccl_comm, 
+    m.def("init_nccl_comm", &init_nccl_comm,
           "Initialize NCCL communicator",
-          py::arg("process_group"), py::arg("rank"), py::arg("world_size"));
+          py::arg("process_group"), py::arg("rank"), py::arg("world_size"),
+          py::arg("key_suffix") = std::string(""));
+
+    m.def("destroy_nccl_comm", &destroy_nccl_comm,
+          "Destroy the user-NCCL communicator (best effort, swallow errors)");
     
     m.def("moe_nccl_forward", &moe_nccl_forward, 
           "NCCL-based MoE All-to-All forward pass",
