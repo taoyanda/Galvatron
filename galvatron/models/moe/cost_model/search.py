@@ -309,6 +309,7 @@ class MoESearcher:
         num_attention_layers: Optional[int] = None,
         num_expert_layers: Optional[int] = None,
         num_stages_behind: int = 0,
+        micro_bsz: Optional[int] = None,
     ) -> SearchResult:
         """Score one parallel layout against one workload.
 
@@ -335,22 +336,36 @@ class MoESearcher:
         reserve to every non-last stage (count of extra microbatches,
         default 0 = no reserve, calibrated baseline). See
         :class:`PPCostModel` for details.
+
+        ``micro_bsz`` is the GLOBAL microbatch size (total samples per
+        forward-backward step across all data-dim-sharing ranks). When
+        ``None`` (default), it falls back to ``global_bsz`` — i.e. one
+        microbatch per optimizer step (``num_microbatches = 1``). Set
+        ``micro_bsz < global_bsz`` to model multi-microbatch pipelines
+        (``num_microbatches = global_bsz // micro_bsz`` > 1), which
+        gives ``pp > 1`` configs a non-degenerate critical path. Must
+        divide ``global_bsz``, and must satisfy ``dp × ep ≤ micro_bsz``
+        per probed config (configs that fail go to infeasible).
         """
         if num_attention_layers is None:
             num_attention_layers = num_layers
         if num_expert_layers is None:
             num_expert_layers = num_layers
 
-        # ``micro_bsz`` is the GLOBAL microbatch size (total samples per
-        # forward-backward step across all data-dim-sharing ranks). With
-        # ``dp × ep`` ranks sharing the data dim, each rank gets
-        # ``micro_bsz // (dp × ep)`` samples per microbatch step. We
-        # default to ``micro_bsz = global_bsz`` (one microbatch per
-        # optimizer step), which preserves the calibrated single-
-        # microbatch physics of today's runtime profile sweep. Configs
-        # where ``dp × ep > micro_bsz`` are filtered out — per-rank
-        # batch would be < 1 sample.
-        micro_bsz = global_bsz
+        # micro_bsz: default to global_bsz (single-microbatch physics —
+        # what the runtime calibration sweep ran). With ``dp × ep`` ranks
+        # sharing the data dim, each rank gets ``micro_bsz // (dp × ep)``
+        # samples per microbatch step.
+        if micro_bsz is None:
+            micro_bsz = global_bsz
+        if global_bsz % micro_bsz != 0:
+            return SearchResult(
+                cfg=cfg,
+                error=f"global_bsz ({global_bsz}) not divisible by "
+                      f"micro_bsz ({micro_bsz})",
+                num_attention_layers=num_attention_layers,
+                num_expert_layers=num_expert_layers,
+            )
         if cfg["dp"] * cfg["ep"] > micro_bsz:
             return SearchResult(
                 cfg=cfg,
@@ -423,6 +438,7 @@ class MoESearcher:
         num_attention_layers: Optional[int] = None,
         num_expert_layers: Optional[int] = None,
         num_stages_behind: int = 0,
+        micro_bsz: Optional[int] = None,
         sort_key: Optional[Callable[[SearchResult], Any]] = None,
         configs: Optional[Iterable[Dict[str, Any]]] = None,
     ) -> RankedSearch:
@@ -485,6 +501,7 @@ class MoESearcher:
                 num_attention_layers=num_attention_layers,
                 num_expert_layers=num_expert_layers,
                 num_stages_behind=num_stages_behind,
+                micro_bsz=micro_bsz,
             )
             if result.error is not None or result.query is None:
                 infeasible.append(result)
