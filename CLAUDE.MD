@@ -60,10 +60,9 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
 ---
-<!-- 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes. -->
+<!-- **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes. -->
 
-The content below provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Runtime environment
 
@@ -97,7 +96,7 @@ cd galvatron/models/moe       && bash scripts/profile_computation.sh
 cd galvatron/models/moe       && bash scripts/profile_memory.sh
 ```
 
-`profile_computation_full.sh` runs three passes (`all`, `attention`, `mlp`) into the same `computation_profiling_bf16_<model>.json`; the `mlp` slice is the one the LAER solver consumes (`solver.py:41`). Profiling scripts set `ENABLE_SOLVER=0` so per-layer time/memory readings are stationary — preserve this when editing them.
+`profile_computation.sh` and `profile_memory.sh` are now **three-pass loops** over `--profile_unit ∈ {all, attention, mlp}` (refactored to feed the cost-model's per-component split — see "Cost model" below). The `mlp` slice is the one the LAER solver consumes (`solver.py:41`); the `all` slice is the back-compat full-block path. Profiling scripts set `ENABLE_SOLVER=0` so per-layer time/memory readings are stationary — preserve this when editing them.
 
 Train (full args list — see `galvatron/models/moe/scripts/train.sh`):
 
@@ -107,9 +106,25 @@ bash galvatron/models/moe/scripts/train.sh <model_name> <layer_num> <aux_loss> <
 
 `<approach>` ∈ {`LAER`, `FLEX`, `FSDP`} — this is mapped to `SOLVER` ∈ {`LAER`, `FLEX`, `NONE`} that the runtime reads.
 
+Calibration sweep + cost-model entry points:
+
+```
+# Per-config calibration runs (~30 configs, ~3 min each on 4×A6000):
+bash galvatron/models/moe/scripts/cost_model_real_test.sh
+
+# Aggregate logs into runtime / FSEP / optimizer profiles (CPU-only):
+docker exec hetu python3 galvatron/models/moe/scripts/profile_cost_model_terms.py
+
+# Search the parallelization space:
+docker exec hetu python3 galvatron/models/moe/scripts/cost_model_search.py [--num-stages-behind N] [--asymmetry-range LO HI]
+
+# Verify split-arithmetic invariants (no GPU):
+docker exec hetu python3 galvatron/models/moe/scripts/cost_model_split_regression.py
+```
+
 Artifact-evaluation (paper figures) entry points live in `scripts_ae/` (`e2e.sh`, `convergence.sh`, `breakdown.sh`, `token_counts.sh`, `planner.sh`, `ablation.sh`, `plot.sh`). Each plot script has a matching `<fig>_analysis.py` / `<fig>_plot.py`. `scripts_ae/env.sh` defines `NUM_NODES`, `NUM_GPUS_PER_NODE`, `MASTER_ADDR/PORT`, `NODE_RANK` and NCCL env — source it (or set the same vars) before any distributed launch.
 
-Tests: `pytest.ini` declares markers (`distributed`, `model`, `parallel`, `search_engine`, `profiler`, `utils`) and `testpaths = tests`, but no `tests/` directory is committed. There is no working unit-test entry point; validation is via the AE scripts above.
+Tests: `pytest.ini` declares markers (`distributed`, `model`, `parallel`, `search_engine`, `profiler`, `utils`) and `testpaths = tests`, but no `tests/` directory is committed. There is no working unit-test entry point for the legacy code; the cost-model package has its own regression suite at `galvatron/models/moe/scripts/cost_model_split_regression.py` (24 invariants, no GPU required).
 
 ## Architecture (big picture)
 
@@ -119,13 +134,15 @@ This repo is the LAER-MoE artifact built on top of Galvatron's hybrid-parallel r
 
 2. **`galvatron/core/runtime/moe/`** — MoE-specific runtime. Token dispatcher (`smart_routing.py`, `token_dispatcher.py`), router, fused kernels (`fused_kernel.py`), and the asynchronous expert-placement system in `prefetch/` (`async_linear_programming.py`, `solver.py`, `fsdp_patch.py`).
 
-3. **`galvatron/core/profiler/`** — model and runtime profilers (`model_profiler.py`, `runtime_profiler.py`, `base_profiler.py`); CLI args in `arguments.py`. Outputs `computation_profiling_*.json` and `memory_profiling_*.json` consumed by the search/cost model.
+3. **`galvatron/core/profiler/`** — model and runtime profilers (`model_profiler.py`, `runtime_profiler.py`, `base_profiler.py`); CLI args in `arguments.py`. Outputs `computation_profiling_*.json` and `memory_profiling_*.json` consumed by the search/cost model. The `_attention` / `_mlp` per-component slices are emitted when `--profile_unit` ≠ `all`.
 
 The MoE entry-point is **`galvatron/models/moe/`**:
 - `MoEModel_hybrid_parallel.py` / `_sequential.py` / `_tensor_parallel.py` — model construction at each parallel granularity.
+- `__init__.py` — package init wraps the runtime imports in `try / except ImportError` so the cost-model subpackage stays importable on CPU-only systems (where the compiled MoE kernels aren't built).
 - `train_dist.py`, `train_dist_random.py`, `train_dist_with_profile.py`, `profile_dist_static.py` — launchers (selected by `train.sh` via `GALVATRON_PROFILE`).
-- `meta_configs/*.json` — predefined model configs (mixtral-8x7b-{e8k2,e16k4}, mixtral-8x22b-*, qwen-8x7b-*, mixtral-tiny). Loaded via `meta_configs/config_utils.py`.
+- `meta_configs/*.json` — predefined model configs (mixtral-8x7b-{e8k2,e16k4}, mixtral-8x22b-*, qwen-8x7b-*, qwen-30b-a3b-e128k8, mixtral-tiny). Loaded via `meta_configs/config_utils.py`. Naming starts with a family prefix that gates per-model arg branches (`qwen-30…` → `qk_layernorm=True`; `qwen-8x…` → `add_qkv_bias=True`).
 - `configs/` — profiled time/memory and Galvatron strategy JSONs that the runtime reads at training time. `network_config.json` carries link-bandwidth coefficients (`inter_node`, `intra_node`).
+- `cost_model/` — the cost-model package. See "Cost model" below.
 
 Hardware profiles consumed by the cost model live in `galvatron/profile_hardware/hardware_configs/` (`allreduce_bandwidth_*.json`, `p2p_bandwidth_*.json`, `overlap_coefficient.json`, `sp_time_*.json`). These must match the cluster shape (`{nodes}nodes_{gpus}gpus_per_node`) named in the filenames.
 
@@ -140,6 +157,34 @@ End-to-end docs in `doc/LAER_MOE_NOTES.md`. Per-MoE-layer step:
 5. `sync_htod()` swaps the new placement into the live FSDP handle; the next forward picks it up through the fused routing kernels.
 
 If the solver isn't ready in time the previous layout is reused. `ENABLE_SOLVER=0` (env) disables the whole loop — required during profiling so per-iteration cost stays stationary.
+
+### Cost model
+
+`galvatron/models/moe/cost_model/` is a standalone CPU-only package that predicts per-iteration time, max-stage time, and peak memory for a parallelization config without launching a real run. Used by the search driver and intended for integration into a higher-level `Facade` (see `doc/cost_model_facade_integration.md`).
+
+Three layers, mirroring the runtime:
+
+- **`base.py`** — `ICostModel` abstract interface; `CostEstimate` (full diagnostic breakdown); `CostQuery` (focused 3-metric façade — `iter_ms`, `max_stage_ms`, `peak_memory_mb` + provenance).
+- **`intra.py`** — `IntraCostModel`: cost of running `num_layers` transformer layers on one pipeline stage. Reads profile JSONs (computation, memory, runtime, FSEP overhead, optimizer step, embedding/lm-head, network) at construction; never mutates state thereafter.
+- **`pp.py`** — `PPCostModel`: 1F1B-aware orchestrator over `IntraCostModel`. Has a runtime-profile shortcut at calibrated shapes that returns the measured `iter_ms` directly; per-stage compositional path for asymmetric or uncalibrated configs.
+- **`search.py`** — `MoESearcher`, `SearchResult`, `RankedSearch`. Object-style search API. Holds a long-lived `PPCostModel`, exposes `score(cfg, …)` for one-config probes and `rank(…)` for batched + filtered + sorted results. Single-process by design; outer loops parallelize.
+
+Both `IntraCostModel.estimate(...)` and `PPCostModel.estimate(...)` accept these high-leverage kwargs:
+
+- `num_attention_layers` / `num_expert_layers` — asymmetric layer counts. Default to `num_layers` (1:1, the runtime layout). Diverging requires a per-component computation profile at the queried shape; uses the `_attention` / `_mlp` slopes to split per-layer time, applies the `_attention_param_share` analytical formula for memory.
+- `num_stages_behind` — pure-additive integer. Each stage's effective in-flight count becomes `(pp − k + 1) + num_stages_behind`. Memory-only knob; iter_ms / max_stage_ms stay calibrated. Useful for modelling framework buffer overhead and OOM-margin-sensitive search probes.
+- `fsep` — bool. Triggers the FSEP overhead profile (per-MoE-layer time + memory delta from matched on/off calibration runs). Uniform-FSEP rule: overhead scales with `num_expert_layers`, attention is fsep-invariant.
+
+The `query()` method on every cost model returns a `CostQuery` dataclass — the right shape for external callers (planners, search loops). `estimate()` returns a `CostEstimate` with the full diagnostic breakdown — used by drift / regression scripts.
+
+Profile artifacts under `galvatron/models/moe/configs/`:
+- `runtime_profiling_<prec>_<model>.json` — per-`(tp, ep, micro_bsz, seq, fsep[, pp])` shape: `fwd_bwd_ms`, `opt_ms`, `iter_ms`, `params_mb`, `optimizer_mb`, `activation_peak_mb`, `cuda_peak_mb` + α/β fits across `num_layers` when ≥ 2 N samples exist.
+- `fsep_overhead_profiling_<prec>_<model>.json` — per-MoE-layer FSEP delta. Field name is `time_overhead_per_expert_layer_ms` / `memory_overhead_per_expert_layer_mb` (legacy aliases without `_expert` are kept).
+- `optimizer_step_profiling_<prec>_<model>.json` — Adam throughput + empirical `optimizer_to_params_ratio_median`.
+- `embedding_lmhead_profiling_<prec>_<model>.json` — standalone embed + lm-head timings.
+- `non-solver/computation_profiling_*.json`, `non-solver/memory_profiling_*.json` — processed per-layer slopes (unsuffixed = `all`, `_attention` / `_mlp` when the three-pass loop ran).
+
+Programmatic usage is documented in `doc/cost_model_guide.md` (sections §2 estimate / query API, §3 search CLI, §3f programmatic search, §4 asymmetric layers, §4-bis `num_stages_behind`, §5 multiprocessing notes). Integration target is documented in `doc/cost_model_facade_integration.md`.
 
 ### Configuration modes
 
@@ -156,3 +201,7 @@ Two ways to drive parallelism (see `galvatron/models/README.md` for full details
 - Checkpoints come in two formats: Megatron-LM (`checkpoints/megatron/<name>`) and LAER (`checkpoints/laer/<name>`). `galvatron/tools/convert_to_laer.py` converts between them; both formats start from the same Megatron checkpoint to keep convergence comparable across approaches.
 - Solver disable: any time you change a profiling script or write one, set `ENABLE_SOLVER=0` so per-step time/memory readings aren't perturbed by online expert migration.
 - Pre-built `.so` artefacts (`greedy_balancer.cpython-*.so`, `moe_all_to_all_kernels.cpython-*.so`) are checked in at the repo root for both py3.9 and py3.12 ABIs. `pip install -e .` will rebuild them; if you only edit Python you can avoid touching them.
+- The cost-model package is **CPU-only**. `galvatron/models/moe/__init__.py` wraps the runtime stack import in a `try/except ImportError` so `from galvatron.models.moe.cost_model import …` works on machines without the compiled MoE kernels (fresh cloud instances, CI runners, design-space probes).
+- Domain conventions kept in the cost model: `pp / dp / tp / ep` for parallel degrees, `fsep` for the LAER smart-routing kernel, `mb` suffix for "megabytes," `ms` suffix for "milliseconds." Avoid these as bare local names.
+- Variable-naming preference: meaningful names over acronyms. `num_microbatches` not `n_micro`; `runtime_entry` not `rt_entry`; `attention_time_per_layer_ms` not `t_attn_per`. The exception is the small set of domain abbreviations above and field names that already ship in JSON profiles (don't churn the on-disk format without re-aggregating).
+- Pre-existing snapshots live alongside the working tree under `~/galvatron-*-checkpoint-*` directories. Useful as recovery points when the working tree's untracked files (configs, logs, CLAUDE.md) get cleaned up.

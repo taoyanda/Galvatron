@@ -7,10 +7,10 @@ cost. Pure orchestration; all real cost computation lives in
 1F1B critical-path formula
 --------------------------
 
-Under 1F1B with ``pp`` uniform stages and ``n_micro`` microbatches, the
+Under 1F1B with ``pp`` uniform stages and ``num_microbatches`` microbatches, the
 critical path of one training iteration is::
 
-    pipeline_iter_ms = (n_micro + pp - 1) × max_stage_compute_ms
+    pipeline_iter_ms = (num_microbatches + pp - 1) × max_stage_compute_ms
 
 where ``max_stage_compute_ms`` is the slowest single-microbatch stage
 compute time. Post-backward terms (DP all-reduce, EP all-to-all if not
@@ -20,7 +20,7 @@ total iteration time is::
     total_iter_ms = pipeline_iter_ms + max_stage_post_bwd_ms
 
 In-flight memory under 1F1B steady-state: stage ``k`` (1-indexed from the
-first stage) holds ``min(pp - k + 1, n_micro)`` microbatches of activation
+first stage) holds ``min(pp - k + 1, num_microbatches)`` microbatches of activation
 in flight. The first stage is the memory hot-spot.
 
 Stage placement of embedding / lm-head:
@@ -101,12 +101,51 @@ class PPCostModel(ICostModel):
         sequence_parallel: bool = True,
         bwd_mult: float = 2.0,
         fsep: bool = False,
+        # Asymmetric layer counts; default to symmetric (= num_layers).
+        # Both must be divisible by pp; per-stage we get
+        # num_attention_layers // pp attention sublayers and
+        # num_expert_layers // pp expert sublayers (uniform layout).
+        num_attention_layers: Optional[int] = None,
+        num_expert_layers: Optional[int] = None,
+        # Extra activation reserve hyperparameter — see docstring below.
+        num_stages_behind: int = 0,
         **kwargs: Any,
     ) -> CostEstimate:
         """Estimate full-iteration cost under 1F1B.
 
         ``num_gpus`` describes the **total** allocation; per-stage GPU
         count is ``num_gpus // pp = dp × tp × ep``.
+
+        Asymmetric layer counts: pass ``num_attention_layers`` and/or
+        ``num_expert_layers`` to project a hypothetical layout where the
+        block isn't 1:1. Both must divide pp evenly; the runtime-profile
+        shortcut (anchored on 1:1 calibrations) is skipped under
+        asymmetric queries and the per-stage composition runs instead.
+
+        ``num_stages_behind`` is a hyperparameter for "how many extra
+        microbatches of activation memory each stage reserves for
+        downstream stages." The reserve is **pure-additive**: every
+        stage's effective in-flight count becomes
+        ``(pp − k + 1) + num_stages_behind`` — uniform across all
+        stages including the last one, and even at ``pp == 1`` (the
+        single stage gets ``+num_stages_behind`` extra microbatches).
+
+        At ``num_stages_behind == 0`` (default) the cost model behaves
+        exactly as today.
+
+        Use cases:
+
+          - Modelling framework-specific buffer overheads (Megatron's
+            send/recv keep-alive buffers, FSDP per-stage scratch, etc.)
+            that aren't captured by the analytical in-flight count.
+          - Probing the search space — "what if every stage held one
+            more microbatch's worth of activations? What optima get
+            filtered out by the OOM check?"
+
+        ``num_stages_behind`` is a memory-only knob — ``iter_ms`` and
+        ``max_stage_ms`` stay anchored on the calibrated runtime
+        profile when available; only the activation reserve delta is
+        added analytically.
         """
         if dp * pp * tp * ep != num_gpus:
             raise ValueError(
@@ -117,10 +156,52 @@ class PPCostModel(ICostModel):
             raise ValueError(
                 f"num_layers ({num_layers}) must be divisible by pp ({pp})"
             )
+        if num_attention_layers is None:
+            num_attention_layers = num_layers
+        if num_expert_layers is None:
+            num_expert_layers = num_layers
+        if num_attention_layers % pp != 0 or num_expert_layers % pp != 0:
+            raise ValueError(
+                f"num_attention_layers ({num_attention_layers}) and "
+                f"num_expert_layers ({num_expert_layers}) must each be "
+                f"divisible by pp ({pp}). Heterogeneous per-stage layouts "
+                f"are not yet supported."
+            )
+        if num_stages_behind < 0:
+            raise ValueError(
+                f"num_stages_behind={num_stages_behind} must be ≥ 0 "
+                f"(count of extra microbatches to reserve)"
+            )
+        asymmetric = (num_attention_layers != num_expert_layers)
+        # ``num_stages_behind`` is a pure-additive count: every stage's
+        # effective n_behind is ``natural_n_behind + num_stages_behind``,
+        # i.e. every stage (including the last and the single pp == 1
+        # stage) reserves +num_stages_behind microbatches of activation
+        # memory on top of its standard 1F1B in-flight count.
+        reserve_active = (num_stages_behind > 0)
+        # ``micro_batch_size`` is the GLOBAL microbatch size; both DP
+        # and EP shard the data dim, so per-actual-rank sample count is
+        # ``micro_batch_size // (dp * ep)``. Validate divisibility and
+        # the ≥1-sample-per-rank constraint here — IntraCostModel re-
+        # validates per-stage but PPCostModel's runtime-profile shortcut
+        # path also needs the per-rank value to form lookup keys.
         if global_batch_size is None:
-            global_batch_size = micro_batch_size * dp
-        n_micro = global_batch_size // (dp * micro_batch_size)
+            global_batch_size = micro_batch_size
+        if dp * ep > micro_batch_size:
+            raise ValueError(
+                f"dp*ep ({dp}*{ep}={dp*ep}) > micro_batch_size "
+                f"({micro_batch_size}); per-rank batch < 1 sample."
+            )
+        if micro_batch_size % (dp * ep) != 0:
+            raise ValueError(
+                f"micro_batch_size ({micro_batch_size}) must be divisible "
+                f"by dp*ep ({dp*ep})."
+            )
+        per_rank_micro_bsz = micro_batch_size // (dp * ep)
+        num_microbatches = global_batch_size // micro_batch_size
         layers_per_stage = num_layers // pp
+        attn_layers_per_stage = num_attention_layers // pp
+        expert_layers_per_stage = num_expert_layers // pp
         num_gpus_per_stage = dp * tp * ep
 
         # ---------- Whole-pipeline runtime-profile shortcut ----------
@@ -129,12 +210,16 @@ class PPCostModel(ICostModel):
         # to compute totals at the requested ``num_layers``. This captures
         # PP send/recv comm + bubble overhead + per-rank framework memory
         # under 1F1B that the per-stage compositional model misses.
+        # Skipped under asymmetric queries: the calibration was 1:1, so
+        # extrapolating the whole-iter ms by num_layers can't tell us
+        # what would happen with extra/fewer expert layers. We route
+        # through the per-stage composition instead.
         pp_key = (
-            f"tp{tp}_ep{ep}_bsz{micro_batch_size}_seq{seq_len}"
+            f"tp{tp}_ep{ep}_bsz{per_rank_micro_bsz}_seq{seq_len}"
             f"_fsep{'on' if fsep else 'off'}" + ("" if pp == 1 else f"_pp{pp}")
         )
         runtime_pp_entry = None
-        if self.runtime_profile is not None:
+        if not asymmetric and self.runtime_profile is not None:
             runtime_pp_entry = self.runtime_profile.get("by_shape", {}).get(pp_key)
         alpha_beta_fits = (runtime_pp_entry or {}).get("alpha_beta_fit") or {}
         # Two-tier lookup: if the requested ``num_layers`` matches one of
@@ -181,25 +266,75 @@ class PPCostModel(ICostModel):
             )
             iter_ms_fit = alpha_beta_fits.get("iter_ms", {})
             cuda_peak_fit = alpha_beta_fits.get("cuda_peak_mb", {})
+            # The shortcut anchors on a calibrated whole-iter measurement;
+            # we don't have post-bwd terms broken out, so the best we can do
+            # for ``stage_bottleneck_ms`` is the structural inverse of the
+            # 1F1B critical path: iter_ms ≈ (num_microbatches + pp − 1) × bottleneck.
+            # Under-counts post-bwd by absorbing it into the bottleneck;
+            # documented in cost_model_guide.md.
+            divisor = max(1, num_microbatches + pp - 1)
+            stage_bottleneck_ms = iter_ms_resolved / divisor
+            pipeline_iter_ms = stage_bottleneck_ms * divisor
+
+            # ``num_stages_behind`` adds reserve activation memory on
+            # top of the calibrated peak; the calibrated value didn't
+            # see that reserve so we compute the delta analytically and
+            # stack it. Time stays calibrated — this is a memory-only
+            # knob.
+            memory_source = (
+                f"runtime_profile[{pp_key}]+{resolution_mode}"
+                f"(N_pts={num_data_points})"
+            )
+            peak_mb_total = peak_mb_resolved
+            activation_mb_total = activation_mb_resolved
+            extra_reserve_mb = 0.0
+            if reserve_active:
+                # Peak stage under 1F1B is the first stage; it has
+                # n_behind = pp − 1 ≥ 1 (active). The reserve is
+                # ``num_stages_behind`` extra microbatches of full-stage
+                # activation memory — uniform additive, no per-stage
+                # scaling.
+                per_microbatch_act_mb = self.intra.per_microbatch_activation_mb(
+                    num_layers=layers_per_stage,
+                    per_rank_micro_bsz=per_rank_micro_bsz,
+                    seq_len=seq_len, tp=tp, recompute=recompute,
+                    sequence_parallel=sequence_parallel,
+                )
+                extra_reserve_mb = num_stages_behind * per_microbatch_act_mb
+                peak_mb_total += extra_reserve_mb
+                activation_mb_total += extra_reserve_mb
+                memory_source = (
+                    memory_source + f"+num_stages_behind({num_stages_behind})"
+                )
+
             return CostEstimate(
                 total_iter_ms=iter_ms_resolved,
-                peak_memory_mb=peak_mb_resolved,
+                peak_memory_mb=peak_mb_total,
                 breakdown={
                     "schedule": "1f1b",
                     "pp": pp,
-                    "n_microbatches": float(n_micro),
+                    "num_microbatches": float(num_microbatches),
                     "layers_per_stage": float(layers_per_stage),
+                    "stage_compute_ms": stage_bottleneck_ms,
+                    "stage_bottleneck_ms": stage_bottleneck_ms,
+                    "pipeline_iter_ms": pipeline_iter_ms,
+                    "bottleneck_stage": "single" if pp == 1 else "uniform",
+                    "memory_stage": "single" if pp == 1 else "first",
+                    # Layout — at the shortcut path we're on the
+                    # calibrated 1:1 anchor so attn == expert == num_layers.
+                    "num_attention_layers": float(num_attention_layers),
+                    "num_expert_layers": float(num_expert_layers),
+                    "asymmetric": asymmetric,
+                    "num_stages_behind": int(num_stages_behind),
+                    "num_stages_behind_extra_mb": extra_reserve_mb,
                     "time_source": (
                         f"runtime_profile[{pp_key}]+{resolution_mode}"
                         f"(N_pts={num_data_points})"
                     ),
-                    "memory_source": (
-                        f"runtime_profile[{pp_key}]+{resolution_mode}"
-                        f"(N_pts={num_data_points})"
-                    ),
+                    "memory_source": memory_source,
                     "parameters_mb": params_mb_resolved,
                     "optimizer_mb": optim_mb_resolved,
-                    "activations_mb": activation_mb_resolved,
+                    "activations_mb": activation_mb_total,
                     "model_states_mb": params_mb_resolved + optim_mb_resolved,
                     "iter_ms_alpha": iter_ms_fit.get("alpha"),
                     "iter_ms_beta": iter_ms_fit.get("beta"),
@@ -230,16 +365,18 @@ class PPCostModel(ICostModel):
         if pp == 1:
             stage = self.intra.estimate(
                 num_layers=num_layers,
+                num_attention_layers=num_attention_layers,
+                num_expert_layers=num_expert_layers,
                 has_embedding=True,
                 has_lmhead=True,
-                in_flight_microbatches=n_micro,
+                in_flight_microbatches=num_microbatches,
                 **intra_kwargs,
             )
             breakdown = dict(stage.breakdown)
             breakdown.update(
                 {
                     "pp": 1,
-                    "n_microbatches": float(n_micro),
+                    "num_microbatches": float(num_microbatches),
                     "pipeline_iter_ms": stage.breakdown["stage_compute_ms"],
                     "stage_bottleneck_ms": stage.breakdown["stage_compute_ms"],
                     "memory_stage": "single",
@@ -253,32 +390,52 @@ class PPCostModel(ICostModel):
             )
 
         # ---------- pp >= 2 ----------
-        # First stage holds pp microbatches in flight at 1F1B steady state
-        # (capped by n_micro when there are fewer microbatches than stages).
-        first_stage = self.intra.estimate(
+        # Each stage gets ``attn_layers_per_stage`` attention sublayers and
+        # ``expert_layers_per_stage`` expert sublayers (uniform layout —
+        # heterogeneous per-stage layouts are rejected at the divisibility
+        # check above).
+        per_stage_split_kwargs = dict(
             num_layers=layers_per_stage,
+            num_attention_layers=attn_layers_per_stage,
+            num_expert_layers=expert_layers_per_stage,
+        )
+        # 1F1B steady-state in-flight count for stage k (1-indexed) is
+        # ``pp − k + 1``; we use the first/middle/last representatives
+        # below. Every stage additionally reserves ``num_stages_behind``
+        # microbatches of activation memory — pure-additive uniform
+        # reserve, applied to every stage including the last (its
+        # natural n_behind is 0 but the reserve adds num_stages_behind
+        # on top).
+        def _in_flight(base: int) -> int:
+            return base + num_stages_behind
+
+        # First stage holds pp microbatches in flight at 1F1B steady state
+        # (capped by num_microbatches when there are fewer microbatches than stages).
+        first_stage = self.intra.estimate(
             has_embedding=True,
             has_lmhead=False,
-            in_flight_microbatches=min(pp, n_micro),
+            in_flight_microbatches=_in_flight(min(pp, num_microbatches)),
+            **per_stage_split_kwargs,
             **intra_kwargs,
         )
-        # Last stage holds 1 microbatch in flight under 1F1B.
+        # Last stage holds 1 microbatch in flight under 1F1B; the
+        # reserve still applies under the pure-additive rule.
         last_stage = self.intra.estimate(
-            num_layers=layers_per_stage,
             has_embedding=False,
             has_lmhead=True,
-            in_flight_microbatches=1,
+            in_flight_microbatches=_in_flight(1),
+            **per_stage_split_kwargs,
             **intra_kwargs,
         )
-        # Representative middle stage (when pp >= 3): holds ~pp/2 microbatches
-        # at steady state. Skipped for pp == 2.
+        # Representative middle stage (when pp >= 3): holds ~pp/2
+        # microbatches at steady state. Skipped for pp == 2.
         middle_stage: Optional[CostEstimate] = None
         if pp >= 3:
             middle_stage = self.intra.estimate(
-                num_layers=layers_per_stage,
                 has_embedding=False,
                 has_lmhead=False,
-                in_flight_microbatches=max(1, pp // 2),
+                in_flight_microbatches=_in_flight(max(1, pp // 2)),
+                **per_stage_split_kwargs,
                 **intra_kwargs,
             )
 
@@ -291,7 +448,7 @@ class PPCostModel(ICostModel):
             ((name, stage.breakdown["stage_compute_ms"]) for name, stage in stages),
             key=lambda name_and_compute: name_and_compute[1],
         )
-        pipeline_iter_ms = (n_micro + pp - 1) * bottleneck_compute_ms
+        pipeline_iter_ms = (num_microbatches + pp - 1) * bottleneck_compute_ms
 
         # Post-backward terms run in parallel across stages → take the max.
         max_post_bwd_ms = max(self._stage_post_bwd_ms(stage) for _, stage in stages)
@@ -307,8 +464,14 @@ class PPCostModel(ICostModel):
         breakdown: dict = {
             "schedule": "1f1b",
             "pp": pp,
-            "n_microbatches": float(n_micro),
+            "num_microbatches": float(num_microbatches),
             "layers_per_stage": float(layers_per_stage),
+            "num_attention_layers": float(num_attention_layers),
+            "num_expert_layers": float(num_expert_layers),
+            "asymmetric": asymmetric,
+            "attention_layers_per_stage": float(attn_layers_per_stage),
+            "expert_layers_per_stage": float(expert_layers_per_stage),
+            "num_stages_behind": int(num_stages_behind),
             "pipeline_iter_ms": pipeline_iter_ms,
             "stage_bottleneck_ms": bottleneck_compute_ms,
             "bottleneck_stage": bottleneck_name,

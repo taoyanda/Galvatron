@@ -1,6 +1,11 @@
-"""Brute-force config search: enumerate (pp, dp, tp, ep, dp_mode, fsep)
-combinations, estimate each via :class:`PPCostModel`, sort, and report
-the best.
+"""Brute-force config search CLI.
+
+Thin command-line wrapper around :class:`MoESearcher`. The actual
+search logic — enumeration, scoring, filtering, ranking — lives in
+:mod:`galvatron.models.moe.cost_model.search`. External callers
+(planners, design-space probes, "compose results across partial
+models" loops) should import :class:`MoESearcher` directly instead of
+calling this script's CLI.
 
 Usage::
 
@@ -16,26 +21,46 @@ Filters infeasible combinations:
   - ``peak_memory > gpu_memory_mb`` (OOM filter; can be disabled by
     passing ``gpu_memory_mb=0``).
 
-Sorts by ``total_iter_ms`` ascending; ties broken by lower peak memory.
+Sorts by ``iter_ms`` ascending; ties broken by lower peak memory.
 Top-K is printed with the breakdown source (``time_source`` /
 ``memory_source``) so the caller can tell which estimates came from a
 runtime-profile lookup vs. analytical fall-back.
+
+Back-compat shims
+-----------------
+
+The historical module-level helpers ``search``, ``estimate_one``, and
+``enumerate_configs`` are still importable from this module; they
+delegate to :class:`MoESearcher` so older imports keep working. New
+code should use :class:`MoESearcher` directly.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.normpath(os.path.join(_HERE, "..", "..", "..", "..")))
 
-from galvatron.models.moe.cost_model import PPCostModel  # noqa: E402
+from galvatron.models.moe.cost_model import (  # noqa: E402
+    MoESearcher,
+    PPCostModel,
+    RankedSearch,
+    SearchResult,
+    enumerate_configs as _enumerate_configs,
+)
 
 
-def _divisors(value: int) -> List[int]:
-    return [d for d in range(1, value + 1) if value % d == 0]
+# ---------------------------------------------------------------------------
+# Back-compat module-level API
+# ---------------------------------------------------------------------------
+# Older code (e.g. cost_model_search_compare.py) imports ``search`` from
+# this module and consumes ``viable`` / ``infeasible`` lists of dicts.
+# We delegate to MoESearcher and project the dataclasses back to dicts
+# so those callers don't need to change. New code should import
+# MoESearcher directly.
 
 
 def enumerate_configs(
@@ -44,31 +69,42 @@ def enumerate_configs(
     num_experts: int,
     dp_modes: List[str],
     fsep_modes: List[str],
-) -> Iterator[Dict[str, Any]]:
-    """Yield every (pp, dp, tp, ep, dp_mode, fsep) tuple that satisfies the
-    structural constraints. Viability checks (memory budget, etc.) are
-    applied by the caller."""
-    for pp in _divisors(num_gpus):
-        if num_layers % pp != 0:
-            continue
-        per_stage_world = num_gpus // pp
-        for dp in _divisors(per_stage_world):
-            for tp in _divisors(per_stage_world // dp):
-                ep = per_stage_world // (dp * tp)
-                if ep < 1 or ep > num_experts:
-                    continue
-                for dp_mode in dp_modes:
-                    for fsep in fsep_modes:
-                        if fsep == "on":
-                            # FSEP requires tp × ep == per_stage_world
-                            # AND ep | num_experts (so capacity_per_device
-                            # is integer and ≥ 1, satisfying ep × cap ≥ E).
-                            if tp * ep != per_stage_world:
-                                continue
-                            if num_experts % ep != 0:
-                                continue
-                        yield dict(pp=pp, dp=dp, tp=tp, ep=ep,
-                                   dp_mode=dp_mode, fsep=fsep)
+):
+    """Back-compat alias for :func:`cost_model.enumerate_configs`."""
+    return _enumerate_configs(
+        num_gpus=num_gpus, num_layers=num_layers,
+        num_experts=num_experts,
+        dp_modes=dp_modes, fsep_modes=fsep_modes,
+    )
+
+
+def _result_to_dict(result: SearchResult) -> Dict[str, Any]:
+    """Project a :class:`SearchResult` to the legacy result-dict shape
+    historically returned by ``estimate_one``."""
+    query = result.query
+    if query is None:
+        # Errored result — only ``cfg`` and ``error`` are meaningful.
+        return {"cfg": result.cfg, "error": result.error}
+    return {
+        "cfg": result.cfg,
+        "query": query,
+        "iter_ms": query.iter_ms,
+        "peak_memory_mb": query.peak_memory_mb,
+        "peak_mb": query.peak_memory_mb,  # legacy alias
+        "max_stage_ms": query.max_stage_ms,
+        "bottleneck_stage": query.bottleneck_stage,
+        "memory_stage": query.memory_stage,
+        "num_attention_layers": query.num_attention_layers,
+        "num_expert_layers": query.num_expert_layers,
+        "asymmetric": query.asymmetric,
+        "params_mb": query.breakdown.get("parameters_mb", 0.0),
+        "optim_mb": query.breakdown.get("optimizer_mb", 0.0),
+        "act_mb": query.breakdown.get("activations_mb", 0.0),
+        "time_source": query.time_source,
+        "memory_source": query.memory_source,
+        # Errors only set on infeasible projections.
+        **({"error": result.error} if result.error else {}),
+    }
 
 
 def estimate_one(
@@ -80,62 +116,29 @@ def estimate_one(
     global_bsz: int,
     seq_len: int,
     recompute: bool,
+    num_attention_layers: Optional[int] = None,
+    num_expert_layers: Optional[int] = None,
+    num_stages_behind: int = 0,
 ) -> Optional[Dict[str, Any]]:
-    """Return the cost-model estimate for one config, or ``None`` if the
-    micro-batch can't be evenly partitioned across the dp dimension. On
-    estimator errors (missing profile, bad shape) returns a dict with an
-    ``error`` key for the caller to report."""
-    micro_bsz = max(1, global_bsz // config["dp"])
-    if config["dp"] * micro_bsz != global_bsz:
-        return None
-    try:
-        estimate = cost_model.estimate(
-            num_layers=num_layers, num_gpus=num_gpus,
-            dp=config["dp"], pp=config["pp"],
-            tp=config["tp"], ep=config["ep"],
-            micro_batch_size=micro_bsz, global_batch_size=global_bsz,
-            seq_len=seq_len, sequence_parallel=True,
-            zero_stage=2 if config["dp_mode"] == "zero2sdp" else 3,
-            sdp=(config["dp_mode"] in ("zero2sdp", "zero3")),
-            recompute=recompute, bwd_mult=2.0,
-            fsep=(config["fsep"] == "on"),
-        )
-    except (ValueError, KeyError) as err:
-        return {"cfg": config, "error": str(err)}
-    breakdown = estimate.breakdown
-    return {
-        "cfg": config,
-        "iter_ms": estimate.total_iter_ms,
-        "peak_mb": estimate.peak_memory_mb,
-        "params_mb": breakdown.get("parameters_mb", 0.0),
-        "optim_mb": breakdown.get("optimizer_mb", 0.0),
-        "act_mb": breakdown.get("activations_mb", 0.0),
-        "time_source": breakdown.get("time_source", "?"),
-        "memory_source": breakdown.get("memory_source", "?"),
-    }
-
-
-def _trust_keep(result: Dict[str, Any], trust: str) -> bool:
-    """Return True if ``result`` passes the trust-source filter.
-
-    - ``any``: no filter.
-    - ``calibrated``: both time and memory must come from
-      ``runtime_profile`` (rules out fully-analytical configs without a
-      calibration anchor).
-    - ``sample``: both must come from an exact-N profile sample
-      (strictest — only configs with a real measurement at the requested
-      ``num_layers`` survive).
+    """Back-compat shim. Returns the legacy result-dict shape. New code
+    should use :meth:`MoESearcher.score` directly, which returns a
+    :class:`SearchResult` dataclass.
     """
-    if trust == "any":
-        return True
-    time_source = str(result.get("time_source", ""))
-    memory_source = str(result.get("memory_source", ""))
-    if trust == "calibrated":
-        return (time_source.startswith("runtime_profile")
-                and memory_source.startswith("runtime_profile"))
-    if trust == "sample":
-        return "+sample" in time_source and "+sample" in memory_source
-    raise ValueError(f"unknown trust mode: {trust!r}")
+    searcher = MoESearcher(cost_model=cost_model)
+    result = searcher.score(
+        config,
+        num_layers=num_layers, num_gpus=num_gpus,
+        global_bsz=global_bsz, seq_len=seq_len, recompute=recompute,
+        num_attention_layers=num_attention_layers,
+        num_expert_layers=num_expert_layers,
+        num_stages_behind=num_stages_behind,
+    )
+    if result.error == "micro_bsz × dp != global_bsz":
+        # Historical contract: the inner sweep returns ``None`` (rather
+        # than an error dict) for this specific filter so the caller
+        # can skip silently.
+        return None
+    return _result_to_dict(result)
 
 
 def search(
@@ -151,45 +154,37 @@ def search(
     fsep_modes: Tuple[str, ...] = ("on", "off"),
     recompute: bool = True,
     trust: str = "any",
+    num_attention_layers: Optional[int] = None,
+    num_expert_layers: Optional[int] = None,
+    num_stages_behind: int = 0,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Return ``(viable, infeasible)`` lists. ``viable`` is sorted by
-    ``iter_ms`` ascending; ``infeasible`` collects everything that
-    errored out, exceeded ``gpu_memory_mb``, or was filtered by
-    ``trust``."""
-    cost_model = PPCostModel(model_name)
-    viable: List[Dict[str, Any]] = []
-    infeasible: List[Dict[str, Any]] = []
-    for config in enumerate_configs(
-        num_gpus, num_layers, num_experts, list(dp_modes), list(fsep_modes)
-    ):
-        result = estimate_one(
-            cost_model, config,
-            num_layers=num_layers, num_gpus=num_gpus,
-            global_bsz=global_bsz, seq_len=seq_len, recompute=recompute,
-        )
-        if result is None:
-            continue
-        if "error" in result:
-            infeasible.append(result)
-            continue
-        if (gpu_memory_mb is not None
-                and result["peak_mb"] > gpu_memory_mb):
-            result["error"] = (
-                f"OOM: peak_mb={result['peak_mb']:.0f} > budget {gpu_memory_mb:.0f}"
-            )
-            infeasible.append(result)
-            continue
-        if not _trust_keep(result, trust):
-            result["error"] = f"filtered (trust={trust})"
-            infeasible.append(result)
-            continue
-        viable.append(result)
-    viable.sort(key=lambda row: (row["iter_ms"], row["peak_mb"]))
-    return viable, infeasible
+    """Back-compat shim. Returns ``(viable, infeasible)`` lists of
+    legacy-shape result dicts. New code should use
+    :meth:`MoESearcher.rank`, which returns a :class:`RankedSearch`."""
+    searcher = MoESearcher(model_name)
+    ranked = searcher.rank(
+        num_gpus=num_gpus, num_layers=num_layers,
+        global_bsz=global_bsz, seq_len=seq_len,
+        gpu_memory_mb=gpu_memory_mb, num_experts=num_experts,
+        dp_modes=dp_modes, fsep_modes=fsep_modes,
+        recompute=recompute, trust=trust,
+        num_attention_layers=num_attention_layers,
+        num_expert_layers=num_expert_layers,
+        num_stages_behind=num_stages_behind,
+    )
+    return (
+        [_result_to_dict(r) for r in ranked.viable],
+        [_result_to_dict(r) for r in ranked.infeasible],
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI presentation helpers
+# ---------------------------------------------------------------------------
 
 
 def _shorten_source(source: str) -> str:
-    """Compact label for the time_source / memory_source breakdown field."""
+    """Compact label for the time_source / memory_source fields."""
     compact = (
         source.replace("runtime_profile[", "rt[")
               .replace("alpha_beta_fit", "α/β")
@@ -202,17 +197,136 @@ def _shorten_source(source: str) -> str:
     return compact[:18]
 
 
+def _print_top_k(ranked: RankedSearch, top_k: int) -> None:
+    header = (
+        f"{'rk':>2} {'pp':>2} {'dp':>2} {'tp':>2} {'ep':>2} "
+        f"{'dp_mode':>9} {'fsep':>4} | "
+        f"{'iter_ms':>9} {'max_stg':>9} {'peak_mb':>9} "
+        f"{'bot':>6} {'mem':>6} | "
+        f"{'params':>7} {'optim':>7} {'act':>7} | "
+        f"{'time_src':>18} {'mem_src':>18}"
+    )
+    print(header)
+    print("-" * len(header))
+    for rank, result in enumerate(ranked.top(top_k), 1):
+        cfg = result.cfg
+        query = result.query
+        breakdown = query.breakdown
+        print(
+            f"{rank:>2} {cfg['pp']:>2} {cfg['dp']:>2} "
+            f"{cfg['tp']:>2} {cfg['ep']:>2} "
+            f"{cfg['dp_mode']:>9} {cfg['fsep']:>4} | "
+            f"{query.iter_ms:>9.0f} "
+            f"{query.max_stage_ms:>9.0f} "
+            f"{query.peak_memory_mb:>9.0f} "
+            f"{query.bottleneck_stage[:6]:>6} "
+            f"{query.memory_stage[:6]:>6} | "
+            f"{breakdown.get('parameters_mb', 0.0):>7.0f} "
+            f"{breakdown.get('optimizer_mb', 0.0):>7.0f} "
+            f"{breakdown.get('activations_mb', 0.0):>7.0f} | "
+            f"{_shorten_source(query.time_source):>18} "
+            f"{_shorten_source(query.memory_source):>18}"
+        )
+
+
+def _run_asymmetry_sweep(
+    searcher: MoESearcher, args: argparse.Namespace,
+    budget: Optional[float],
+) -> None:
+    """Sweep ``n_expert ∈ [num_layers + LO .. num_layers + HI]`` at fixed
+    ``n_attn = num_layers``; print one summary row per point with the
+    best config's iter_ms / max_stage_ms / peak_memory_mb."""
+    lo, hi = args.asymmetry_range
+    n_attn = args.num_layers
+    print(
+        f"# Asymmetric-layer sweep: {searcher.model_name}\n"
+        f"#   num_gpus={args.num_gpus}  n_attn={n_attn} "
+        f"n_expert ∈ [{n_attn + lo} .. {n_attn + hi}]  "
+        f"global_bsz={args.global_bsz}  seq_len={args.seq_len}  "
+        f"trust={args.trust_source}\n"
+    )
+    header = (
+        f"{'n_attn':>6} {'n_exp':>6} | {'pp':>2} {'dp':>2} {'tp':>2} {'ep':>2} "
+        f"{'dp_mode':>9} {'fsep':>4} | "
+        f"{'iter_ms':>9} {'max_stg':>9} {'peak_mb':>9} | mem_src"
+    )
+    print(header)
+    print("-" * len(header))
+    for delta in range(lo, hi + 1):
+        n_exp = n_attn + delta
+        if n_exp < 0:
+            continue
+        ranked = searcher.rank(
+            num_gpus=args.num_gpus, num_layers=args.num_layers,
+            global_bsz=args.global_bsz, seq_len=args.seq_len,
+            gpu_memory_mb=budget, num_experts=args.num_experts,
+            trust=args.trust_source,
+            num_attention_layers=n_attn,
+            num_expert_layers=n_exp,
+            num_stages_behind=args.num_stages_behind,
+        )
+        if not ranked.viable:
+            print(f"{n_attn:>6} {n_exp:>6} | (no viable configs)")
+            continue
+        best = ranked.best
+        cfg = best.cfg
+        print(
+            f"{n_attn:>6} {n_exp:>6} | "
+            f"{cfg['pp']:>2} {cfg['dp']:>2} "
+            f"{cfg['tp']:>2} {cfg['ep']:>2} "
+            f"{cfg['dp_mode']:>9} {cfg['fsep']:>4} | "
+            f"{best.iter_ms:>9.0f} {best.max_stage_ms:>9.0f} "
+            f"{best.peak_memory_mb:>9.0f} | "
+            f"{_shorten_source(best.query.memory_source)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--model", default="mixtral-8x7b-e8k2")
     parser.add_argument("--num-gpus", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument(
+        "--num-attention-layers", type=int, default=None,
+        help="Override the attention sublayer count (default: --num-layers). "
+             "Diverging from --num-expert-layers requires a per-component "
+             "computation profile at the queried (tp, ep, micro_bsz, seq).",
+    )
+    parser.add_argument(
+        "--num-expert-layers", type=int, default=None,
+        help="Override the MoE sublayer count (default: --num-layers). "
+             "FSEP overhead and EP all-to-all volume scale with this count "
+             "under the uniform-FSEP rule.",
+    )
+    parser.add_argument(
+        "--asymmetry-range", type=int, nargs=2, metavar=("LO", "HI"),
+        default=None,
+        help="Sweep n_expert ∈ [num_layers + LO .. num_layers + HI] at "
+             "fixed n_attn = num_layers. Each value runs a full search "
+             "and reports the best config for that expert-layer count.",
+    )
     parser.add_argument("--global-bsz", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument(
         "--gpu-memory-mb", type=float, default=45000.0,
         help="OOM filter: drop configs with peak > this. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--num-stages-behind", type=int, default=0, metavar="INT",
+        help="Hyperparameter (count): extra microbatches of activation "
+             "memory each stage reserves on top of the standard 1F1B "
+             "in-flight count. Pure-additive — every stage's effective "
+             "in-flight becomes (pp − k + 1) + num_stages_behind, "
+             "uniform across all stages including the last and at "
+             "pp == 1. Default 0 (calibrated baseline). Useful for "
+             "modelling framework buffer overhead or probing OOM-margin-"
+             "sensitive optima.",
     )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--show-infeasible", action="store_true")
@@ -227,76 +341,85 @@ def main() -> None:
     args = parser.parse_args()
 
     budget = args.gpu_memory_mb if args.gpu_memory_mb > 0 else None
-    viable, infeasible = search(
-        args.model, num_gpus=args.num_gpus, num_layers=args.num_layers,
+    searcher = MoESearcher(args.model)
+
+    # Asymmetry sweep: one ranking per n_expert point.
+    if args.asymmetry_range is not None:
+        _run_asymmetry_sweep(searcher, args, budget)
+        return
+
+    ranked = searcher.rank(
+        num_gpus=args.num_gpus, num_layers=args.num_layers,
         global_bsz=args.global_bsz, seq_len=args.seq_len,
         gpu_memory_mb=budget, num_experts=args.num_experts,
         trust=args.trust_source,
+        num_attention_layers=args.num_attention_layers,
+        num_expert_layers=args.num_expert_layers,
+        num_stages_behind=args.num_stages_behind,
+    )
+
+    n_attn = (args.num_attention_layers
+              if args.num_attention_layers is not None else args.num_layers)
+    n_exp = (args.num_expert_layers
+             if args.num_expert_layers is not None else args.num_layers)
+    asymmetric = n_attn != n_exp
+    layer_label = (
+        f"num_layers={args.num_layers}" if not asymmetric
+        else f"num_attention_layers={n_attn}  num_expert_layers={n_exp}"
+    )
+    reserve_label = (
+        "" if args.num_stages_behind == 0
+        else f"  num_stages_behind={args.num_stages_behind}"
     )
 
     print(
         f"# Cost-model config search: {args.model}\n"
-        f"#   num_gpus={args.num_gpus}  num_layers={args.num_layers}  "
+        f"#   num_gpus={args.num_gpus}  {layer_label}  "
         f"global_bsz={args.global_bsz}  seq_len={args.seq_len}  "
         f"gpu_budget={'disabled' if budget is None else f'{budget:.0f} MB'}  "
-        f"trust={args.trust_source}\n"
-        f"# {len(viable)} viable / {len(infeasible)} infeasible\n"
+        f"trust={args.trust_source}{reserve_label}\n"
+        f"# {len(ranked.viable)} viable / {len(ranked.infeasible)} infeasible\n"
     )
 
-    if not viable:
+    if not ranked.viable:
         print("no viable configurations found.")
-        if infeasible and args.show_infeasible:
+        if ranked.infeasible and args.show_infeasible:
             print("\n## infeasible (top 10):")
-            for result in infeasible[:10]:
-                print(f"  {result['cfg']}  →  {result.get('error', '?')}")
+            for result in ranked.infeasible[:10]:
+                print(f"  {result.cfg}  →  {result.error or '?'}")
         return
 
-    header = (
-        f"{'rk':>2} {'pp':>2} {'dp':>2} {'tp':>2} {'ep':>2} "
-        f"{'dp_mode':>9} {'fsep':>4} | "
-        f"{'iter_ms':>9} {'peak_mb':>9} | "
-        f"{'params':>7} {'optim':>7} {'act':>7} | "
-        f"{'time_src':>18} {'mem_src':>18}"
-    )
-    print(header)
-    print("-" * len(header))
-    for rank, result in enumerate(viable[:args.top_k], 1):
-        config = result["cfg"]
-        print(
-            f"{rank:>2} {config['pp']:>2} {config['dp']:>2} "
-            f"{config['tp']:>2} {config['ep']:>2} "
-            f"{config['dp_mode']:>9} {config['fsep']:>4} | "
-            f"{result['iter_ms']:>9.0f} {result['peak_mb']:>9.0f} | "
-            f"{result['params_mb']:>7.0f} {result['optim_mb']:>7.0f} "
-            f"{result['act_mb']:>7.0f} | "
-            f"{_shorten_source(result['time_source']):>18} "
-            f"{_shorten_source(result['memory_source']):>18}"
-        )
+    _print_top_k(ranked, args.top_k)
 
     print()
-    best = viable[0]
-    best_config = best["cfg"]
+    best = ranked.best
+    cfg = best.cfg
     print(
-        f"## Optimal: pp={best_config['pp']} dp={best_config['dp']} "
-        f"tp={best_config['tp']} ep={best_config['ep']} "
-        f"{best_config['dp_mode']} fsep={best_config['fsep']}"
+        f"## Optimal: pp={cfg['pp']} dp={cfg['dp']} "
+        f"tp={cfg['tp']} ep={cfg['ep']} "
+        f"{cfg['dp_mode']} fsep={cfg['fsep']}"
     )
     print(
-        f"   iter_ms={best['iter_ms']:.0f}  peak_mb={best['peak_mb']:.0f}  "
-        f"(time_src={_shorten_source(best['time_source'])}, "
-        f"mem_src={_shorten_source(best['memory_source'])})"
+        f"   iter_ms={best.iter_ms:.0f}  "
+        f"max_stage_ms={best.max_stage_ms:.0f}  "
+        f"peak_memory_mb={best.peak_memory_mb:.0f}  "
+        f"(bottleneck={best.query.bottleneck_stage}, "
+        f"mem_stage={best.query.memory_stage}, "
+        f"time_src={_shorten_source(best.query.time_source)}, "
+        f"mem_src={_shorten_source(best.query.memory_source)})"
     )
 
-    if args.show_infeasible and infeasible:
+    if args.show_infeasible and ranked.infeasible:
         print()
-        print(f"## infeasible ({len(infeasible)} total, showing first 10):")
-        for result in infeasible[:10]:
-            config = result["cfg"]
-            err = result.get("error", "?")[:60]
+        print(f"## infeasible ({len(ranked.infeasible)} total, "
+              f"showing first 10):")
+        for result in ranked.infeasible[:10]:
+            cfg = result.cfg
+            err = (result.error or "?")[:60]
             print(
-                f"  pp={config['pp']} dp={config['dp']} "
-                f"tp={config['tp']} ep={config['ep']} "
-                f"{config['dp_mode']} fsep={config['fsep']}: {err}"
+                f"  pp={cfg['pp']} dp={cfg['dp']} "
+                f"tp={cfg['tp']} ep={cfg['ep']} "
+                f"{cfg['dp_mode']} fsep={cfg['fsep']}: {err}"
             )
 
 

@@ -121,14 +121,14 @@ def parse_log(path: str) -> Dict[str, Optional[float]]:
 
 def _micro_bsz(global_bsz: int, tp: int, ep: int,
                pp: int = 1, chunks: int = 1) -> int:
-    """Per-DP-rank micro batch size = ``global_bsz / (dp × chunks)``.
+    """Per-actual-rank micro batch size at calibration.
 
-    ``dp = NUM_GPUS_PER_NODE / (pp × tp × ep)``. The previous version
-    assumed ``pp == 1`` and over-counted dp at pp>1, so the resulting
-    runtime-profile key picked the wrong micro-bsz suffix.
+    Both DP and EP shard the data dimension, so the number of ranks
+    sharing the data dim is ``dp × ep = NUM_GPUS_PER_NODE / (pp × tp)``.
+    Per-rank micro batch = ``global_bsz / (dp × ep × chunks)``.
     """
-    dp = max(1, NUM_GPUS_PER_NODE // (pp * tp * ep))
-    return max(1, global_bsz // dp // chunks)
+    data_ranks = max(1, NUM_GPUS_PER_NODE // (pp * tp))
+    return max(1, global_bsz // data_ranks // chunks)
 
 
 def _shape_key(tp: int, ep: int, micro_bsz: int, fsep: str,
@@ -363,16 +363,23 @@ def _build_fsep_overhead_profile(by_shape_n: Dict) -> Dict:
             memory_overhead_per_layer_mb = (
                 (on["cuda_peak_mb"] - off["cuda_peak_mb"]) / num_layers
             )
+        # Under 1:1 the calibration's num_layers equals the expert-layer
+        # count, so this divisor is the right one for "per expert layer."
+        # The new field name documents that explicitly; the legacy alias
+        # `time_overhead_per_layer_ms` is kept for back-compat.
         samples.append({
             "tp": on["tp"], "ep": on["ep"],
             "micro_bsz": on["micro_bsz"], "pp": on["pp"],
             "num_layers": num_layers,
+            "num_expert_layers": num_layers,  # 1:1 invariant
             "fwd_bwd_off_ms": off["fwd_bwd_ms"],
             "fwd_bwd_on_ms": on["fwd_bwd_ms"],
-            "time_overhead_per_layer_ms": time_overhead_per_layer_ms,
+            "time_overhead_per_expert_layer_ms": time_overhead_per_layer_ms,
+            "time_overhead_per_layer_ms": time_overhead_per_layer_ms,  # legacy alias
             "cuda_peak_off_mb": off.get("cuda_peak_mb"),
             "cuda_peak_on_mb": on.get("cuda_peak_mb"),
-            "memory_overhead_per_layer_mb": memory_overhead_per_layer_mb,
+            "memory_overhead_per_expert_layer_mb": memory_overhead_per_layer_mb,
+            "memory_overhead_per_layer_mb": memory_overhead_per_layer_mb,  # legacy alias
         })
         # Per-shape key drops num_layers from the lookup key so callers
         # can request a different num_layers and we just scale by it.
@@ -383,33 +390,41 @@ def _build_fsep_overhead_profile(by_shape_n: Dict) -> Dict:
         prior = by_shape.get(shape_key)
         if prior is None:
             by_shape[shape_key] = {
+                "time_overhead_per_expert_layer_ms": time_overhead_per_layer_ms,
+                "memory_overhead_per_expert_layer_mb": memory_overhead_per_layer_mb,
+                # Legacy aliases for back-compat with callers that haven't
+                # been updated yet.
                 "time_overhead_per_layer_ms": time_overhead_per_layer_ms,
                 "memory_overhead_per_layer_mb": memory_overhead_per_layer_mb,
                 "n_samples": 1,
             }
         else:
             count = prior["n_samples"]
-            prior["time_overhead_per_layer_ms"] = (
-                (prior["time_overhead_per_layer_ms"] * count
+            new_time = (
+                (prior["time_overhead_per_expert_layer_ms"] * count
                  + time_overhead_per_layer_ms)
                 / (count + 1)
             )
+            prior["time_overhead_per_expert_layer_ms"] = new_time
+            prior["time_overhead_per_layer_ms"] = new_time
             if (memory_overhead_per_layer_mb is not None
-                    and prior["memory_overhead_per_layer_mb"] is not None):
-                prior["memory_overhead_per_layer_mb"] = (
-                    (prior["memory_overhead_per_layer_mb"] * count
+                    and prior["memory_overhead_per_expert_layer_mb"] is not None):
+                new_mem = (
+                    (prior["memory_overhead_per_expert_layer_mb"] * count
                      + memory_overhead_per_layer_mb)
                     / (count + 1)
                 )
+                prior["memory_overhead_per_expert_layer_mb"] = new_mem
+                prior["memory_overhead_per_layer_mb"] = new_mem
             prior["n_samples"] = count + 1
 
     if samples:
         time_default = statistics.median(
-            s["time_overhead_per_layer_ms"] for s in samples
+            s["time_overhead_per_expert_layer_ms"] for s in samples
         )
         memory_values = [
-            s["memory_overhead_per_layer_mb"] for s in samples
-            if s["memory_overhead_per_layer_mb"] is not None
+            s["memory_overhead_per_expert_layer_mb"] for s in samples
+            if s["memory_overhead_per_expert_layer_mb"] is not None
         ]
         memory_default = statistics.median(memory_values) if memory_values else 0.0
     else:
@@ -418,8 +433,15 @@ def _build_fsep_overhead_profile(by_shape_n: Dict) -> Dict:
 
     return {
         "model": MODEL, "precision": PRECISION, "seq_len": SEQ_LEN,
-        "default_time_overhead_per_layer_ms": time_default,
-        "default_memory_overhead_per_layer_mb": memory_default,
+        # New canonical names: clarify "per expert layer" vs the
+        # historical "per layer" (which under 1:1 calibration was the
+        # same thing). The cost model prefers the new names but falls
+        # back to the legacy ones when a re-aggregation hasn't run.
+        "default_time_overhead_per_expert_layer_ms": time_default,
+        "default_memory_overhead_per_expert_layer_mb": memory_default,
+        "default_time_overhead_per_layer_ms": time_default,    # legacy alias
+        "default_memory_overhead_per_layer_mb": memory_default,  # legacy alias
+        "num_expert_layers_in_calibration": NUM_MOE_LAYERS,
         "by_shape": by_shape,
         "samples": samples,
     }
