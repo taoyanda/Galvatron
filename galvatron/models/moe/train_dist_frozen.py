@@ -25,6 +25,113 @@ from galvatron.models.moe.MoEModel_hybrid_parallel import (
 )
 from galvatron.utils import distributed_dataloader, print_loss, set_seed
 from megatron.training.arguments import _print_args
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+
+def _maybe_load_deterministic_batch(args, fallback_batch, device):
+    """Load ``static_inputs/{model_size}_bs{N}_{precision}.pt`` if present.
+
+    The file format mirrors ``_build_static_synthetic_batch`` in dataloader.py
+    (dict with ``tokens``/``labels``/``loss_mask``/``position_ids``/``attention_mask``).
+    We translate it back into the ``(tokens, kwargs, loss_func)`` tuple shape
+    that ``random_collate_fn`` produces so the rest of the training loop is
+    unchanged. ``per_rank_bsz`` is read off the dataloader's first batch so
+    we don't have to compute the DP-shard division ourselves.
+    """
+    fb_tokens, fb_kwargs, fb_loss_func = fallback_batch
+    per_rank_bsz = fb_tokens.shape[0]
+    static_inputs_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "static_inputs"
+    )
+    fname = (
+        f"{args.model_size}_bs{per_rank_bsz}_{args.mixed_precision}.pt"
+    )
+    path = os.path.join(static_inputs_dir, fname)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if not os.path.isfile(path):
+        if rank == 0:
+            print(
+                f"[static_input] deterministic file not found at {path}, "
+                f"falling back to dataloader random batch (bsz={per_rank_bsz})",
+                flush=True,
+            )
+        return fallback_batch
+    loaded = torch.load(path, map_location="cpu")
+    tokens = loaded["tokens"].to(device)
+    labels = loaded["labels"].to(device)
+    rotary_pos_emb = RotaryEmbedding(
+        args.hidden_size // args.num_attention_heads,
+        args.rotary_percent,
+        seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+        rotary_base=args.rotary_base,
+    )
+    rotary_embedding = rotary_pos_emb(tokens.shape[-1])
+    attention_mask = loaded.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+    if rank == 0:
+        print(
+            f"[static_input] loaded deterministic batch from {path} "
+            f"tokens.shape={tuple(tokens.shape)} sum={tokens.sum().item()} "
+            f"first8={tokens.flatten()[:8].tolist()}",
+            flush=True,
+        )
+    return (
+        tokens,
+        {
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "rotary_embedding": rotary_embedding,
+        },
+        fb_loss_func,
+    )
+
+
+def _collect_router_gate_params(model):
+    """Return the list of router-gate ``nn.Parameter`` objects in ``model``.
+
+    The routing decision under the smart-routing dispatcher reads from the
+    ``Router.weight`` gate (initialised in
+    ``galvatron/core/runtime/moe/router.py``). We locate it by walking
+    ``model.modules()`` and isolating instances of the ``Router`` base class
+    — robust against the ``MoERouter`` → ``TopKRouter`` nesting and any
+    FSDP / DDP / pipeline wrappers that rewrite parameter qualified names.
+    """
+    try:
+        from galvatron.core.runtime.moe.router import Router as _RouterBase
+    except Exception:
+        return []
+    gate_params = []
+    seen = set()
+    for module in model.modules():
+        if not isinstance(module, _RouterBase):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None:
+            continue
+        if id(weight) in seen:
+            continue
+        seen.add(id(weight))
+        gate_params.append((f"router#{len(gate_params)}", weight))
+    return gate_params
+
+
+def _zero_router_gate_grads(gate_params):
+    """Zero the gradient of each cached router-gate parameter in-place.
+
+    Called between backward and optimizer.step under ``--static_input`` to
+    keep routing decisions bit-identical across iters. The optimizer still
+    iterates over these params (paying the m / v bookkeeping cost), but
+    with ``grad == 0`` the gate weights don't move, so the next iter's
+    ``num_global_tokens_per_expert`` is identical to iter 0's. See
+    ``galvatron/core/runtime/moe/smart_routing.py:189`` for the
+    determinism check that this fix flips from MISMATCH to MATCH.
+    """
+    for _name, p in gate_params:
+        if p.grad is not None:
+            p.grad.detach_()
+            p.grad.zero_()
+
 
 # Graceful-shutdown hooks — best effort. SIGTERM under timeout, normal
 # Python exit, and uncaught-exception paths all funnel here. Goal:
@@ -248,13 +355,36 @@ def train(args):
 
     static_input = getattr(args, "static_input", False)
     cached_batch = None
+    # Cache router-gate params once. Under --static_input we zero their
+    # gradient between backward and optimizer.step so routing decisions stay
+    # bit-identical iter-to-iter while the optimizer still iterates over
+    # the gate params (paying their m/v memory + compute cost).
+    router_gate_params = _collect_router_gate_params(model) if static_input else []
+    if static_input and rank == 0:
+        print(
+            f"[static_input] freezing {len(router_gate_params)} router-gate "
+            f"param(s) to keep dispatch bit-identical across iters; "
+            f"optimizer.step() still iterates over them so timing/memory are "
+            f"unaffected.",
+            flush=True,
+        )
     for ep in range(args.epochs):
         if not args.check_loss and not args.profile:
             trainloader = tqdm(trainloader)
         for iter, batch in enumerate(trainloader):
             if static_input:
                 if cached_batch is None:
-                    cached_batch = batch
+                    # Prefer the deterministic per-bsz file under
+                    # ``static_inputs/{model_size}_bs{N}_{precision}.pt``
+                    # over caching the dataloader's first random batch — the
+                    # deterministic files are bit-stable across runs (built
+                    # by tools/generate_static_input.py) so per-config
+                    # measurements don't drift from sweep to sweep. Falls
+                    # back to caching the random first batch when the file
+                    # is missing.
+                    cached_batch = _maybe_load_deterministic_batch(
+                        args, batch, device
+                    )
                 else:
                     batch = cached_batch
             tokens, kwargs, loss_func = batch
@@ -294,6 +424,15 @@ def train(args):
                     f"[mem_evo] post_fwd_bwd_mb={torch.cuda.max_memory_allocated()/1e6:.2f}",
                     flush=True,
                 )
+
+            # Under --static_input, freeze router-gate weights so the router
+            # produces the same logits next iter → same top-k routing →
+            # ``num_global_tokens_per_expert`` is bit-identical iter-over-iter
+            # (smart_routing.py:189 determinism check goes from MISMATCH to
+            # MATCH). The optimizer still walks these params on .step() so
+            # timing and Adam-state memory are unchanged.
+            if static_input and router_gate_params:
+                _zero_router_gate_grads(router_gate_params)
 
             _op_s = torch.cuda.Event(enable_timing=True) if rank == 0 else None
             _op_e = torch.cuda.Event(enable_timing=True) if rank == 0 else None

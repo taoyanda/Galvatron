@@ -74,12 +74,16 @@ mkdir -p "$(dirname "${STATIC_INPUT_PATH}")"
 echo "Using static input tensor: ${STATIC_INPUT_PATH}"
 
 MODEL_ARGS="
-    --model_size mixtral-8x7b-e8k2 \
+    --model_size qwen-30b-a3b-e128k8 \
     --set_model_config_manually 0 \
     --set_layernum_manually 1 \
-    --vocab_size 32000 \
-    --hidden_size 4096 \
+    --vocab_size 151936 \
+    --hidden_size 2048 \
     --num_attention_heads 32 \
+    --num_key_value_heads 4 \
+    --intermediate_size 768 \
+    --num_local_experts 128 \
+    --num_experts_per_tok 8 \
     --seq_length 4096"
 
 PROFILE_ARGS="

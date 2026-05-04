@@ -26,7 +26,10 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
 export CUDA_HOME='/usr/local/cuda-12.1'
 export CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY:-/tmp/no-such-mps}
-export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+# Leave NCCL_P2P_LEVEL unset so NCCL auto-discovers the per-pair
+# transport at init (NVLink within islands, SHM across islands on the
+# 2×2-island PCIe-A100 topology). Forcing a level caused multi-channel
+# ring construction failures for full-world DP groups.
 export TORCHINDUCTOR_COMPILE_THREADS=1
 
 # Match production training's FSEP-required envelope (see train.sh):
@@ -103,7 +106,7 @@ mkdir -p "${LOG_DIR}"
 LAUNCHER="torchrun --nnodes ${NUM_NODES} --nproc_per_node ${NUM_GPUS_PER_NODE} --master_port ${MASTER_PORT}"
 
 echo "[env] CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY:-<unset>}"
-echo "[env] NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-<unset>}"
+echo "[env] NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL:-<unset>}"
 echo "[env] NCCL_DEBUG=${NCCL_DEBUG}"
 echo "[env] TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS}"
 echo "[env] ENABLE_SOLVER=${ENABLE_SOLVER}"

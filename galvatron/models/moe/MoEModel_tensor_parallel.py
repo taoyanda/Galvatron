@@ -108,21 +108,96 @@ class MoERouter(nn.Module):
         self.idx = layer_number
         self.router = TopKRouter(config=megatron_config)
         self.router.layer_number = layer_number
+        # Under --static_input we want the dispatcher to see a bit-identical
+        # routing decision iter-after-iter so the LAER token-count history
+        # stabilises and the dispatch pattern is reproducible. Zeroing gate
+        # gradients alone is not enough — the *input* to the router drifts
+        # as upstream attention / expert weights are updated by
+        # optimizer.step, and the top-k decision flips assignments for any
+        # token whose 8th-vs-9th expert margin is smaller than the input
+        # drift. We therefore:
+        #   1. Always call ``self.router(hidden_states)`` so its forward
+        #      compute is included in the wall-time / memory measurement.
+        #   2. Cache (probs, routing_map) at iter 0 and substitute the
+        #      cached tensors into the dispatcher input on subsequent
+        #      iters. Cached tensors are detached, so the dispatcher's
+        #      backward path doesn't reach the gate — gate gradients drop
+        #      to whatever the auxiliary load-balance loss contributes
+        #      (still computed, still measured).
+        #   3. Log how many routing-map cells the freshly-computed router
+        #      would have flipped relative to iter 0, gated by a small
+        #      budget so we have a quantitative drift trace.
+        self._static_input = bool(getattr(args, "static_input", False))
+        self._static_routing_cache = None
+        self._static_check_count = 0
+        self._static_check_budget = 20
 
     def forward(self, hidden_states):
         if hasattr(self, "predict"):
             self.predict(hidden_states)
+        # Always call the underlying router so its forward cost (gate Linear,
+        # softmax, top-k, aux loss registration) is part of the measurement,
+        # even when we substitute the cached output below.
         probs, routing_map = self.router(hidden_states)
+        if self._static_input:
+            if self._static_routing_cache is None:
+                self._static_routing_cache = (probs.detach(), routing_map.detach())
+            else:
+                cached_probs, cached_routing_map = self._static_routing_cache
+                if self._static_check_count < self._static_check_budget:
+                    with torch.no_grad():
+                        diff = int((routing_map != cached_routing_map).sum().item())
+                        total = int(routing_map.numel())
+                    if torch.distributed.get_rank() == 0:
+                        tag = "MATCH" if diff == 0 else "MISMATCH"
+                        print(
+                            f"[router_drift] layer={self.idx} "
+                            f"check={self._static_check_count}: "
+                            f"{diff}/{total} routing_map cells differ ({tag})",
+                            flush=True,
+                        )
+                    self._static_check_count += 1
+                # Substitute cached so the dispatcher sees iter-0 routing.
+                probs, routing_map = cached_probs, cached_routing_map
         return probs, routing_map
 
 # TODO: Add shared expert support
 class MoEMLP_tp(nn.Module):
     def __init__(self, config, token_dispatcher, layer_number, tp_group=None, ep_group=None, tp_of_ep_group=None, tp_and_ep_group=None, test_mode=False):
         super().__init__()
+        self._test_mode = test_mode
         if test_mode:
-            megatron_config = core_transformer_config_from_args(get_args())
+            # Build the real per-rank MoE expert stack so that
+            # --profile_unit mlp measures the same per-layer model state and
+            # compute as the FSEP-off real path. The previous short-circuit
+            # to a single dense ParallelMLP under-built each layer by the
+            # full (num_local_experts - 1) experts of optimizer state and
+            # collapsed the per-token expert FFN compute to a single GEMM,
+            # which made the cost model's mlp slope wrong by ~50× for
+            # 128-expert models. See profile_computation.sh / profile_memory.sh
+            # for how this slope feeds the cost model's per-component split.
+            args = get_args()
+            megatron_config = core_transformer_config_from_args(args)
+            self.config = megatron_config
             self.tp_group = tp_group.group if tp_group is not None else None
-            self.mlp = ParallelMLP(megatron_config, tp_group=self.tp_group)
+            self.ep_group = ep_group.group if ep_group is not None else None
+            self.tp_of_ep_group = tp_of_ep_group.group if tp_of_ep_group is not None else None
+            self.tp_and_ep_group = tp_and_ep_group.group if tp_and_ep_group is not None else None
+            self.expert_parallel_size = mpu.get_expert_model_parallel_world_size(self.ep_group)
+            assert self.expert_parallel_size > 0, "Expected non-negative expert parallel size"
+            self.num_global_experts = self.config.num_moe_experts
+            self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
+            self.num_experts_per_tok = args.num_experts_per_tok
+            self.experts = SequentialMLP(
+                self.num_local_experts,
+                self.config,
+                MLPSubmodules(
+                    linear_fc1=ColumnParallelLinear,
+                    linear_fc2=RowParallelLinear,
+                ),
+                self.tp_of_ep_group,
+                self.tp_and_ep_group,
+            )
             return
         args = get_args()
         self.recompute_communication = args.recompute_communication
@@ -220,6 +295,34 @@ class MoEMLP_tp(nn.Module):
                 )
 
     def forward(self, hidden_states, tokens_per_expert, probs=None):
+        if getattr(self, "_test_mode", False):
+            # --profile_unit mlp synthetic dispatch:
+            # mimic the real bsz×seq×top_k dispatched-token volume that a
+            # balanced router with capacity_factor=1 produces, evenly split
+            # across all num_local_experts local experts. Each token is
+            # replicated num_experts_per_tok times along the token dim, the
+            # replicas are split evenly across local experts, and the
+            # expert outputs are then summed across the top_k axis to
+            # recover one output per original token (mirrors what the real
+            # token unpermutation + weighted-sum path produces, modulo the
+            # routing weights — fine for compute / memory profiling).
+            orig_shape = hidden_states.shape
+            hidden = orig_shape[-1]
+            flat = hidden_states.reshape(-1, hidden)
+            if self.num_experts_per_tok > 1:
+                flat = flat.repeat_interleave(self.num_experts_per_tok, dim=0)
+            total_routed = flat.shape[0]
+            base = total_routed // self.num_local_experts
+            tpe = torch.full(
+                (self.num_local_experts,), base,
+                dtype=torch.long, device=flat.device,
+            )
+            tpe[-1] += total_routed - base * self.num_local_experts
+            expert_output, mlp_bias = self.experts(flat, tpe)
+            if self.num_experts_per_tok > 1:
+                expert_output = expert_output.view(-1, self.num_experts_per_tok, hidden).sum(dim=1)
+            expert_output = expert_output.view(*orig_shape)
+            return expert_output, mlp_bias
         if tokens_per_expert is not None:
             if self.use_fsep:
                 if self.recompute_communication:

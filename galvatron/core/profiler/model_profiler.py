@@ -11,6 +11,53 @@ from galvatron.utils.config_utils import array2str, num2str, read_json_config, s
 from .base_profiler import BaseProfiler
 
 
+def _maybe_cap_nccl_channels(cmd: str, world_size: int, pp_deg: int, tp_deg: int, ep_deg: int) -> str:
+    """Prepend ``NCCL_P2P_DISABLE=1`` to ``cmd`` when the inner config's
+    DP group would span the host's P2P-island boundary.
+
+    On hosts whose GPUs split into disjoint P2P islands (e.g. PCIe-A100
+    boxes with two NVLink islands {0,1} and {2,3} that don't share a P2P
+    route), NCCL's multi-channel ring construction fails for any group
+    whose rank count exceeds an island ("ring 1 does not contain rank 0"
+    / "ring 1 does not loop back to start"). Forcing all-SHM transports
+    avoids the malformed multi-channel layout entirely.
+
+    We empirically tested three workarounds on the affected dp=4 inner
+    configs (see doc/cross_numa_nccl_postmortem.md):
+
+    - ``NCCL_MAX_NCHANNELS=1`` works (single ring closes), keeps
+      intra-island NVLink P2P. Slowest of the three.
+    - ``NCCL_IGNORE_DISABLED_P2P=1`` only fixes a subset of configs;
+      ep=1 and ep=2-nl=2 still hit ring-construction or bootstrap-
+      truncation crashes.
+    - ``NCCL_P2P_DISABLE=1`` works for every affected config, and is
+      0–15 % faster than MAX_NCHANNELS=1 because two parallel SHM
+      channels beat a single mixed NVLink+SHM ring at the message
+      sizes we measured.
+
+    We check ``raw_dp = world_size // (pp_deg * tp_deg)`` rather than the
+    EP-sharded ``world_size // (pp_deg * tp_deg * ep_deg)``: FSDP wraps
+    parameter groups using the raw-DP group regardless of whether EP
+    further partitions the data dim. So pp=1 tp=1 ep=2 in a 4-GPU world
+    still has raw_dp=4 spanning both islands, and FSDP's init-time
+    barrier on that group hits the same ring-construction failure as
+    raw dp=4 with ep=1. Gating on raw_dp catches both cases.
+
+    The boundary is communicated by the launching shell script via the
+    ``GALVATRON_P2P_ISLAND_SIZE`` env var; if unset (or raw_dp fits
+    inside a single island), this is a no-op. Configs whose raw_dp
+    stays inside an island keep the default NCCL transport selection,
+    so intra-island NVLink P2P is unaffected.
+    """
+    island = int(os.environ.get("GALVATRON_P2P_ISLAND_SIZE", "0") or 0)
+    if island <= 0 or pp_deg * tp_deg == 0:
+        return cmd
+    raw_dp = world_size // (pp_deg * tp_deg)
+    if raw_dp > island:
+        return "NCCL_P2P_DISABLE=1 " + cmd
+    return cmd
+
+
 class ModelProfiler(BaseProfiler):
     """Model profiler for analyzing model performance characteristics including computation and memory usage"""
 
@@ -272,11 +319,30 @@ class ModelProfiler(BaseProfiler):
         ep_deg = getattr(self.args, "global_ep_deg", 1) if getattr(self.args, "use_fsep", False) else 1
         bsz = getattr(self.args, "profile_batch_size", 1) or 1
 
+        # Memory profiling under FSDP-style sharding (zero2 / zero3) is only
+        # uninformative when **every** parallelism dimension is 1 — that's
+        # the truly unsharded case which we already get implicitly from
+        # other shapes' per-rank measurements (and which can OOM for large
+        # models). When PP / TP / EP > 1 the model state IS sharded by
+        # those dimensions independently of DP, so dp=1 measurements at
+        # those shapes are meaningful and must be kept.
+        # Under DDP / zero1 the full model state lives on every rank
+        # regardless of DP, so dp=1 is always the informative measurement
+        # and the filter never fires.
+        profile_dp_type = getattr(self.args, "profile_dp_type", "zero3")
+        zero23 = profile_dp_type in ("zero2", "zero3")
+
         def _bsz_compatible(pp_, tp_):
             parallel_product = pp_ * tp_ * ep_deg
             if parallel_product == 0 or world_size % parallel_product != 0:
                 return False
             dp_deg = world_size // parallel_product
+            # Skip iff zero2/zero3 AND every parallelism dim is 1 (so DP is
+            # the only candidate sharder, and DP=1 → no sharding). Any of
+            # pp/tp/ep > 1 means the model state is already sharded by that
+            # dim and the dp=1 measurement is informative.
+            if zero23 and dp_deg == 1 and pp_ == 1 and tp_ == 1 and ep_deg == 1:
+                return False
             return dp_deg <= bsz and bsz % dp_deg == 0
 
         for seq in sequence_length_list:
@@ -302,11 +368,21 @@ class ModelProfiler(BaseProfiler):
                                 ARGS_ = self.args2str(args_)
                                 CMD = LAUNCH_SCRIPTS + MODEL_ARGS + PROFILE_ARGS + ARGS_
                                 CMD = self._wrap_with_timeout(CMD)
+                                CMD = _maybe_cap_nccl_channels(CMD, world_size, pp_deg, tp_deg, ep_deg)
                                 print(CMD)
                                 rc = os.system(CMD)
                                 self._report_return_code(rc)
-                    if checkpoint:
-                        break
+                    # Sweep ckpt=1 across all tp degrees, not just tp=1.
+                    # The previous ``if checkpoint: break`` exited the
+                    # tp_deg loop after the first iteration when checkpoint
+                    # was set, which left _process_memory_data without any
+                    # ``{pp}_{tp}_{dp}_c{...}`` strategy keys at tp >= 2 —
+                    # so ``act_cpt_list[l]`` stayed at its sentinel value
+                    # ``-1`` and propagated into the per-(tp, ep) profile
+                    # JSONs as ``"checkpoint": -1``. The cost model's
+                    # ``recompute=True`` queries at tp >= 2 then returned
+                    # garbage. Letting the inner while-loop fully sweep tp
+                    # populates the missing checkpoint anchors.
                     tp_deg *= 2
 
             for pp_deg in [2, 4]:
@@ -329,6 +405,7 @@ class ModelProfiler(BaseProfiler):
                             ARGS_ = self.args2str(args_)
                             CMD = LAUNCH_SCRIPTS + MODEL_ARGS + PROFILE_ARGS + ARGS_
                             CMD = self._wrap_with_timeout(CMD)
+                            CMD = _maybe_cap_nccl_channels(CMD, world_size, pp_deg, tp_deg, ep_deg)
                             print(CMD)
                             rc = os.system(CMD)
                             self._report_return_code(rc)
@@ -398,6 +475,7 @@ class ModelProfiler(BaseProfiler):
                         ARGS_ = self.args2str(args_)
                         CMD = LAUNCH_SCRIPTS + MODEL_ARGS + PROFILE_ARGS + ARGS_
                         CMD = self._wrap_with_timeout(CMD)
+                        CMD = _maybe_cap_nccl_channels(CMD, world_size, pp_deg, tp_deg, ep_deg)
                         print(CMD)
                         # Retrieve and escalate return code from os.system to handle timeouts and failures
                         rc = os.system(CMD)
@@ -570,6 +648,18 @@ class ModelProfiler(BaseProfiler):
         sequence_length_list = list(product(*self.sequence_length_list))
         for tp in tp_values:
             memory_config_path = self.memory_profiling_path_for(tp, ep_deg)
+            # The launch loop intentionally skips some (pp, tp) shapes when
+            # they collapse to dp_deg == 1 under zero2 / zero3 (DP doesn't
+            # change memory pressure with FSDP-style sharding when there is
+            # no DP). Those per-(tp, ep) files therefore never get written;
+            # don't fail aggregation on them — just skip and move on.
+            if not os.path.exists(memory_config_path):
+                print(
+                    f"[memory_profile] no per-(tp,ep) JSON at {memory_config_path}; "
+                    f"skipping aggregation for tp={tp} ep={ep_deg} (likely filtered "
+                    f"by the launch-time DP > 1 rule)."
+                )
+                continue
             config = read_json_config(memory_config_path)
             for seq in sequence_length_list:
                 self._process_single_sequence_config(
@@ -820,15 +910,32 @@ class ModelProfiler(BaseProfiler):
                 tp_deg *= 2
             pp_deg *= 2
 
-        # Handle sequence parallelism memory scaling
+        # Handle sequence parallelism memory scaling.
+        # Under SP+TP, per-rank activation scales as ~ 1/tp (with the seq
+        # dimension sharded across the TP group). The original loop assumed
+        # tp=1 data is always present in the per-(tp,ep) JSON and built up
+        # tp=2,4,8 by halving from tp//2. That breaks when this JSON only
+        # contains data for tp >= 2 launches (e.g. ``..._tp4_ep1.json``
+        # only has the tp=4 launch's strategies); ``act_result_list[0][1]``
+        # then doesn't exist and ``act[2] = act[1]/2`` raises KeyError.
+        # Instead we pick any known (tp, value) pair and derive the rest
+        # by ``value(tp) * tp == const``. Same scaling for the
+        # other_memory_* dicts.
+        def _sp_extrapolate(d):
+            if not d:
+                return
+            seed_tp, seed_val = next(iter(d.items()))
+            baseline = seed_val * seed_tp
+            for tp in [1, 2, 4, 8]:
+                if tp not in d:
+                    d[tp] = baseline / tp
+
         if self.args.sequence_parallel:
-            for tp in [2, 4, 8]:
-                if tp not in act_result_list[0]:
-                    act_result_list[0][tp] = act_result_list[0][tp // 2] / 2
-                for memory_dict in [other_memory_pp_off, other_memory_pp_on_first, other_memory_pp_on_last]:
-                    for key in ["model_states", "activation"]:
-                        if tp not in memory_dict[key]:
-                            memory_dict[key][tp] = memory_dict[key][tp // 2] / 2
+            for l in range(layertype):
+                _sp_extrapolate(act_result_list[l])
+            for memory_dict in [other_memory_pp_off, other_memory_pp_on_first, other_memory_pp_on_last]:
+                for key in ["model_states", "activation"]:
+                    _sp_extrapolate(memory_dict[key])
 
         print("other_memory_pp_off:", other_memory_pp_off)
         print("other_memory_pp_on_first:", other_memory_pp_on_first)

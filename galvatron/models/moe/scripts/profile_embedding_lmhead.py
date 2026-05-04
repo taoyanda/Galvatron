@@ -33,7 +33,7 @@ MODEL_DIR = os.path.normpath(os.path.join(_HERE, ".."))
 META_DIR = os.path.join(MODEL_DIR, "meta_configs")
 CONFIGS_DIR = os.path.join(MODEL_DIR, "configs")
 
-MODEL = "mixtral-8x7b-e8k2"
+MODEL = "qwen-30b-a3b-e128k8"
 PRECISION = "bf16"
 DTYPE = torch.bfloat16
 

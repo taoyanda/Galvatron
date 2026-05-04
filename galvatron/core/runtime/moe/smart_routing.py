@@ -558,10 +558,16 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
     
     def sync_lp_solver(self, debug: bool=True):
         """
-        Sync LP solver after forward pass. If --laer_freeze_after_iter has been
-        reached, stop submitting new solver tasks and let the last placement
-        stand. Prefetch polling in `_async_lp_prefetch_logic` still drains any
-        in-flight task submitted before the freeze.
+        Sync LP solver after forward pass. The LAER solver runs **every** iter
+        regardless of ``--laer_freeze_after_iter`` — its compute and memory
+        overhead are part of the LAER critical path that we want the cost
+        model and timing measurements to reflect.
+
+        ``--laer_freeze_after_iter N`` only stops *applying* the solver's
+        proposed placement past iter N, so the dispatcher keeps using a
+        stable layout (necessary for bit-identical routing under
+        ``--static_input``). The result-discard logic lives in
+        ``_process_lp_result``.
         """
         if not self.async_lp_solver_config["enabled"]:
             return
@@ -569,11 +575,13 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
         if freeze_after is not None and freeze_after >= 0 and self.solver_iter >= freeze_after:
             if not self._freeze_logged:
                 print(
-                    f"[layer {self.layer_number}] layout frozen at iter {self.solver_iter}",
+                    f"[layer {self.layer_number}] layout frozen at iter "
+                    f"{self.solver_iter}; solver continues to run (results discarded)",
                     flush=True,
                 )
                 self._freeze_logged = True
-            return
+            # Fall through — keep submitting / syncing the solver task so the
+            # measured wall time and memory footprint match a real LAER run.
         self.cuda_dtoh_stream.synchronize()
         self.solver_iter += 1
         if debug and torch.distributed.get_rank() == 0 and (self.solver_iter <= 3 or self.solver_iter % 5 == 0):
@@ -663,63 +671,79 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
                 self.async_lp_task_id = None
 
     def _process_lp_result(self, result, debug:bool=True):
-        """Process linear programming optimization result"""
-        if result.get("status") == "success":
-            # Here optimization results can be applied to routing strategy
-            # Actual implementation needs to be adjusted based on specific MoE router interface
-            # print(f"Linear programming optimization result: {result}")
-            new_placement_numpy = result.get("expert_placement_numpy")
-            # Layout-change diagnostic: only meaningful before freeze, since no
-            # further solver tasks will be submitted afterward.
+        """Process linear programming optimization result.
 
-            if debug and torch.distributed.get_rank() == 0 :
-                p_array = np.asarray(new_placement_numpy) if new_placement_numpy is not None else None
-                try:
-                    p_sum = int(p_array.sum())
-                    p_shape = tuple(p_array.shape)
-                except Exception:
-                    p_sum, p_shape = -1, None
-                if self.solver_iter <= 3 or self.solver_iter % 5 == 0:
-                    print(
-                        f"[solver_result] layer={self.layer_number} iter={self.solver_iter} "
-                        f"placement_shape={p_shape} placement_sum={p_sum}",
-                        flush=True,
-                    )
-
-            if not self._freeze_logged and new_placement_numpy is not None:
-                if self._prev_placement_numpy is not None:
-                    try:
-                        changed = not np.array_equal(self._prev_placement_numpy, new_placement_numpy)
-                    except Exception:
-                        changed = True
-                    tag = "changed" if changed else "stable"
-                    print(
-                        f"[layer {self.layer_number}] layout {tag} at iter {self.solver_iter}",
-                        flush=True,
-                    )
-                self._prev_placement_numpy = new_placement_numpy
-            self.global_expert_indices_numpy = new_placement_numpy
-            self.global_expert_indices = result.get("expert_placement")
-            self.global_expert_locations = result.get("global_expert_locations")
-            self.inverse_expert_map = result.get("inverse_expert_map")
-            self.fsdp_handle.global_placement_cpu = self.global_expert_indices
-            # self.fsdp_handle.global_expert_locations_cpu = self.global_expert_locations
-            # self.fsdp_handle.inverse_expert_map_cpu = self.inverse_expert_map
-            # self.cuda_htod_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self.cuda_htod_stream):
-                # TODO: use MemcpyBatchAsync instead.
-                self.global_expert_indices = maybe_move_tensor_to_gpu(
-                    self.global_expert_indices, torch.cuda.current_device(), True
-                )
-                self.global_expert_locations = maybe_move_tensor_to_gpu(
-                    self.global_expert_locations, torch.cuda.current_device(), True
-                )
-                self.inverse_expert_map = maybe_move_tensor_to_gpu(
-                    self.inverse_expert_map, torch.cuda.current_device(), True
-                )
-            self.need_to_sync = True
-        else:
+        Past ``laer_freeze_after_iter`` we still pay the solver compute and
+        memory cost (see ``sync_lp_solver``) but the proposed placement is
+        **not applied** — the dispatcher keeps the cached layout, which is
+        what gives bit-identical routing under ``--static_input``.
+        """
+        if result.get("status") != "success":
             assert False, f"Linear programming optimization failed {result}"
+
+        new_placement_numpy = result.get("expert_placement_numpy")
+        # Layout-change diagnostic: harmless to log past the freeze threshold,
+        # because we explicitly discard the placement below in that case.
+
+        if debug and torch.distributed.get_rank() == 0 :
+            p_array = np.asarray(new_placement_numpy) if new_placement_numpy is not None else None
+            try:
+                p_sum = int(p_array.sum())
+                p_shape = tuple(p_array.shape)
+            except Exception:
+                p_sum, p_shape = -1, None
+            if self.solver_iter <= 3 or self.solver_iter % 5 == 0:
+                print(
+                    f"[solver_result] layer={self.layer_number} iter={self.solver_iter} "
+                    f"placement_shape={p_shape} placement_sum={p_sum}",
+                    flush=True,
+                )
+
+        # Past freeze, discard the new placement so the dispatcher keeps the
+        # last applied layout. We DO let the solver compute the result (we just
+        # already ran the solve in sync_lp_solver) so wall-time and memory
+        # profiling reflect a real LAER iter.
+        freeze_after = self.async_lp_solver_config.get("freeze_after_iter", -1)
+        past_freeze = (
+            freeze_after is not None
+            and freeze_after >= 0
+            and self.solver_iter > freeze_after
+        )
+        if past_freeze:
+            return
+
+        if not self._freeze_logged and new_placement_numpy is not None:
+            if self._prev_placement_numpy is not None:
+                try:
+                    changed = not np.array_equal(self._prev_placement_numpy, new_placement_numpy)
+                except Exception:
+                    changed = True
+                tag = "changed" if changed else "stable"
+                print(
+                    f"[layer {self.layer_number}] layout {tag} at iter {self.solver_iter}",
+                    flush=True,
+                )
+            self._prev_placement_numpy = new_placement_numpy
+        self.global_expert_indices_numpy = new_placement_numpy
+        self.global_expert_indices = result.get("expert_placement")
+        self.global_expert_locations = result.get("global_expert_locations")
+        self.inverse_expert_map = result.get("inverse_expert_map")
+        self.fsdp_handle.global_placement_cpu = self.global_expert_indices
+        # self.fsdp_handle.global_expert_locations_cpu = self.global_expert_locations
+        # self.fsdp_handle.inverse_expert_map_cpu = self.inverse_expert_map
+        # self.cuda_htod_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.cuda_htod_stream):
+            # TODO: use MemcpyBatchAsync instead.
+            self.global_expert_indices = maybe_move_tensor_to_gpu(
+                self.global_expert_indices, torch.cuda.current_device(), True
+            )
+            self.global_expert_locations = maybe_move_tensor_to_gpu(
+                self.global_expert_locations, torch.cuda.current_device(), True
+            )
+            self.inverse_expert_map = maybe_move_tensor_to_gpu(
+                self.inverse_expert_map, torch.cuda.current_device(), True
+            )
+        self.need_to_sync = True
     
     def sync_htod(self):
         if self.need_to_sync:

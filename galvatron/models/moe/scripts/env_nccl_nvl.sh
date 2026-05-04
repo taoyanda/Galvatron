@@ -30,7 +30,7 @@
 # on their native NVLink (~2x throughput vs SHM fallback) while sending the
 # cross-pair DP traffic through SHM/socket — which they would have used
 # anyway since they have no NVLink.
-export NCCL_P2P_LEVEL=NVL
+# export NCCL_P2P_LEVEL=NVL
 
 # Cap NCCL channels to 4 per multi-rank comm. With NVL enabled, NCCL's
 # default selects 8 channels per pair (vs 4 under DISABLE), allocating ~16 MB
@@ -40,7 +40,7 @@ export NCCL_P2P_LEVEL=NVL
 # matches the channel count to DISABLE while keeping NVLink P2P enabled.
 # Empirically this fits on 48 GB cards for normal training (only the
 # profiler's deliberately-edge configs still OOM).
-export NCCL_MAX_NCHANNELS=4
+# export NCCL_MAX_NCHANNELS=4
 
 # Don't override NCCL_BUFFSIZE here — the default (4 MB) is correct.
 # Halving it to 2 MB makes tp=4 ~13 % slower (more comm rounds) and triggers

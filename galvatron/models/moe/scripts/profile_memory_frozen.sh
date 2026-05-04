@@ -25,11 +25,21 @@ export NODE_RANK=${RANK:-0}
 export OMP_NUM_THREADS=8
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
-# NCCL workaround for asymmetric DP-group hang on this host's two 2-rank DP
-# groups {0,2} and {1,3} (identical NODE topology yet only one wedges).
-# Forces SHM fallback for both pairs. See profile_computation_frozen.sh and
-# Fix 10 in doc/profile_computation_frozen_fixes.md.
-export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+# Leave NCCL_P2P_LEVEL unset — NCCL auto-discovers per-pair transport.
+# See profile_computation_frozen.sh for the rationale (forcing NVL on
+# the 2×2-island topology breaks multi-channel ring construction for
+# full-world DP groups). The same script also auto-detects the host's
+# P2P-island size; we mirror that detection here so the inner profiler
+# launcher applies ``NCCL_MAX_NCHANNELS=1`` only for ring-spanning
+# inner configs.
+SCRIPT_DIR_FOR_DETECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_world=$(( NUM_NODES * NUM_GPUS_PER_NODE ))
+_island=$(python3 "${SCRIPT_DIR_FOR_DETECT}/detect_p2p_island_size.py" 2>/dev/null || echo 0)
+if [ "${_island}" -gt 0 ] && [ "${_island}" -lt "${_world}" ]; then
+    export GALVATRON_P2P_ISLAND_SIZE=${_island}
+    echo "[p2p] detected island_size=${_island} world=${_world}; will cap NCCL_MAX_NCHANNELS=1 for dp>island launches"
+fi
+unset _world _island SCRIPT_DIR_FOR_DETECT
 
 export CUDA_HOME='/usr/local/cuda-12.1'
 
@@ -70,12 +80,16 @@ export PROFILE_LAUNCHER="$LAUNCHER"
 export PROFILE_TRAINER="profile_dist_static.py"
 
 MODEL_ARGS="
-    --model_size mixtral-8x7b-e8k2 \
+    --model_size qwen-30b-a3b-e128k8 \
     --set_model_config_manually 0 \
     --set_layernum_manually 1 \
-    --vocab_size 32000 \
-    --hidden_size 4096 \
+    --vocab_size 151936 \
+    --hidden_size 2048 \
     --num_attention_heads 32 \
+    --num_key_value_heads 4 \
+    --intermediate_size 768 \
+    --num_local_experts 128 \
+    --num_experts_per_tok 8 \
     --seq_length 4096"
 
 PROFILE_ARGS="
@@ -98,9 +112,9 @@ PROFILE_ARGS="
 
 # FSEP tuples over (ep, cap) with cap = num_global_experts / ep (=8/ep).
 EP_CAP_TUPLES_DEFAULT=(
-    "1 8"
-    "2 4"
-    "4 2"
+    "1 128"
+    "2 64"
+    "4 32"
 )
 # Allow env override (e.g. EP_CAP_TUPLES_OVERRIDE="1 8" for a focused run).
 if [ -n "${EP_CAP_TUPLES_OVERRIDE:-}" ]; then

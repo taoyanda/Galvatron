@@ -23,25 +23,28 @@ export NODE_RANK=${RANK:-0}
 export OMP_NUM_THREADS=8
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
-# NCCL workaround for asymmetric DP-group hang. The two 2-rank DP groups
-# {0,2} and {1,3} report identical NODE topology in `nvidia-smi topo -m`,
-# but DP-A's first 2-rank collective deterministically wedges on first
-# iter while DP-B's completes. Forcing the two groups onto the same
-# fallback transport unblocks the sweep.
+# Leave NCCL_P2P_LEVEL unset so NCCL auto-discovers the per-pair
+# transport at init. On the 2×2-island PCIe-A100 topology this lets
+# NCCL keep NVLink P2P within each island ({0,1}, {2,3}) and fall
+# back to SHM across islands without us hard-coding a level.
 #
-# Two valid settings tested on this host:
-#   NCCL_P2P_DISABLE=1          — used here. Disables P2P for ALL pairs;
-#       slightly slows TP collectives (NVLink unused) but keeps memory
-#       footprint small. The full sweep completes on a 48 GB A6000.
-#   NCCL_P2P_LEVEL=NVL          — surgical alternative. Preserves P2P on
-#       NVLink-connected pairs (TP) and disables it only on cross-pair
-#       PCIe-NODE links (DP). Fixes the hang AND keeps NVLink hot path,
-#       but NCCL allocates extra registered P2P buffers on the NVLink
-#       comms which pushes the larger inner configs (bsz=4 + layernum=4
-#       at tp=1) over the GPU memory limit. **Don't use NVL on this
-#       host** — it OOMs roughly half the inner configs. NVL is the
-#       right setting on machines with > 48 GB / GPU.
-export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+# Cross-island ring workaround: NCCL builds 2 channels for large
+# all-reduces. On this 2×2-island fabric, channel 1's ring layout
+# cannot close (no cross-island P2P route), so any DP / EP / TP group
+# whose rank count exceeds an island wedges with "ring N does not
+# contain rank 0". We auto-detect island size at script start; the
+# inner profiler launcher reads ``GALVATRON_P2P_ISLAND_SIZE`` and
+# prepends ``NCCL_MAX_NCHANNELS=1`` to the inner CMD ONLY for inner
+# configs whose dp_deg > island_size — preserving multi-channel for
+# everything that fits and fixing only the ring-spanning shapes.
+SCRIPT_DIR_FOR_DETECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_world=$(( NUM_NODES * NUM_GPUS_PER_NODE ))
+_island=$(python3 "${SCRIPT_DIR_FOR_DETECT}/detect_p2p_island_size.py" 2>/dev/null || echo 0)
+if [ "${_island}" -gt 0 ] && [ "${_island}" -lt "${_world}" ]; then
+    export GALVATRON_P2P_ISLAND_SIZE=${_island}
+    echo "[p2p] detected island_size=${_island} world=${_world}; will cap NCCL_MAX_NCHANNELS=1 for dp>island launches"
+fi
+unset _world _island SCRIPT_DIR_FOR_DETECT
 
 export CUDA_HOME='/usr/local/cuda-12.1'
 
@@ -83,15 +86,19 @@ LAUNCHER="${LAUNCHER} --nnodes ${NUM_NODES}"
 LAUNCHER="${LAUNCHER} --nproc_per_node ${NUM_GPUS_PER_NODE}"
 
 export PROFILE_LAUNCHER="$LAUNCHER"
-export PROFILE_TRAINER="train_dist_random.py"
+export PROFILE_TRAINER="train_dist_frozen.py"
 
 MODEL_ARGS="
-    --model_size mixtral-8x7b-e8k2 \
+    --model_size qwen-30b-a3b-e128k8 \
     --set_model_config_manually 0 \
     --set_layernum_manually 1 \
-    --vocab_size 32000 \
-    --hidden_size 4096 \
+    --vocab_size 151936 \
+    --hidden_size 2048 \
     --num_attention_heads 32 \
+    --num_key_value_heads 4 \
+    --intermediate_size 768 \
+    --num_local_experts 128 \
+    --num_experts_per_tok 8 \
     --seq_length 4096"
 
 LAYERNUM_MIN=2
@@ -124,9 +131,9 @@ COMMON_PROFILE_ARGS="
 # when --use_fsep is set the profiler forces global_tp_of_ep_deg = global_tp_deg
 # for every point in the TP sweep. Outer loop only needs EP/cap.
 EP_CAP_TUPLES_DEFAULT=(
-    "1 8"
-    "2 4"
-    "4 2"
+    "1 128"
+    "2 64"
+    "4 32"
 )
 # Allow the env to override the sweep, e.g. EP_CAP_TUPLES_OVERRIDE="1 8" for
 # a focused diagnostic run.
@@ -176,7 +183,7 @@ for UNIT in all; do
             # driver state is dirty for ~10 min after a SIGKILL, so the next
             # (EP, CAP) would inherit the corruption and cascade.
             echo "[outer abort] cleaning up stragglers from ep=${EP} cap=${CAP}"
-            pkill -KILL -f "train_dist_random.py" 2>/dev/null || true
+            pkill -KILL -f "train_dist_frozen.py" 2>/dev/null || true
             pkill -KILL -f "torchrun" 2>/dev/null || true
             sleep 3
             echo "[outer abort] sweep stopped — restart hetu, wait 10 min, then retry the failing config in isolation"

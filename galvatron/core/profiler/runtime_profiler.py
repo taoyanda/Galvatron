@@ -159,31 +159,36 @@ class RuntimeProfiler(BaseProfiler):
                 for key, val in mem_dict.items():
                     print(f"\t{key}: {val:.2f} MB")
 
-                # Save results if requested
-                if hasattr(args, "save_profiled_memory") and args.save_profiled_memory:
-                    assert self.layernum_list is not None
-                    world_size = torch.distributed.get_world_size()
-                    memory_config_path = self.memory_profiling_path()
-
-                    save_profiled_memory(
-                        memory_config_path,
-                        args.pp_deg,
-                        args.global_tp_deg,
-                        world_size,
-                        self.layernum_list,
-                        args.global_train_batch_size,
-                        rank,
-                        mem_dict["model_states"],
-                        mem_dict["activation"],
-                        mem_dict["peak_activation"],
-                        args.global_checkpoint,
-                        args.sequence_parallel,
-                        args.vocab_tp,
-                        self.seqlen_list,
-                        args.profile_unit,
-                    )
-
+            # Save results if requested. Every rank must participate in
+            # save_profiled_memory because the function internally does
+            # WORLD all_reduce_max calls — gating it on ``rank in
+            # profile_ranks`` (the previous behaviour) deadlocks NCCL when
+            # ``world_size > 2`` (the default ``profile_ranks=[0, world-1]``
+            # then excludes ranks 1..world-2). Non-profile ranks contribute
+            # 0, which doesn't shift the MAX away from the real measurements
+            # captured on the profile ranks.
             if hasattr(args, "save_profiled_memory") and args.save_profiled_memory:
+                assert self.layernum_list is not None
+                world_size = torch.distributed.get_world_size()
+                memory_config_path = self.memory_profiling_path()
+
+                save_profiled_memory(
+                    memory_config_path,
+                    args.pp_deg,
+                    args.global_tp_deg,
+                    world_size,
+                    self.layernum_list,
+                    args.global_train_batch_size,
+                    rank,
+                    mem_dict.get("model_states", 0.0),
+                    mem_dict.get("activation", 0.0),
+                    mem_dict.get("peak_activation", 0.0),
+                    args.global_checkpoint,
+                    args.sequence_parallel,
+                    args.vocab_tp,
+                    self.seqlen_list,
+                    args.profile_unit,
+                )
                 exit(0)
 
     # =============== Time Profiling ===============
