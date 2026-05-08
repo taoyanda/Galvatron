@@ -403,7 +403,7 @@ class MoEMLP_tp(nn.Module):
                 )
 
     def forward(self, hidden_states, tokens_per_expert, probs=None):
-        if getattr(self, "_test_mode", False):
+        if self._test_mode == "prof_all":
             # --profile_unit mlp synthetic dispatch:
             # mimic the real bsz×seq×top_k dispatched-token volume that a
             # balanced router with capacity_factor=1 produces, evenly split
