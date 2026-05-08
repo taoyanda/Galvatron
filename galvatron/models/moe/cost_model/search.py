@@ -336,40 +336,41 @@ class MoESearcher:
         reserve to every non-last stage (count of extra microbatches,
         default 0 = no reserve, calibrated baseline). See
         :class:`PPCostModel` for details.
-
-        ``micro_bsz`` is the GLOBAL microbatch size (total samples per
-        forward-backward step across all data-dim-sharing ranks). When
-        ``None`` (default), it falls back to ``global_bsz`` — i.e. one
-        microbatch per optimizer step (``num_microbatches = 1``). Set
-        ``micro_bsz < global_bsz`` to model multi-microbatch pipelines
-        (``num_microbatches = global_bsz // micro_bsz`` > 1), which
-        gives ``pp > 1`` configs a non-degenerate critical path. Must
-        divide ``global_bsz``, and must satisfy ``dp × ep ≤ micro_bsz``
-        per probed config (configs that fail go to infeasible).
         """
         if num_attention_layers is None:
             num_attention_layers = num_layers
         if num_expert_layers is None:
             num_expert_layers = num_layers
 
-        # micro_bsz: default to global_bsz (single-microbatch physics —
-        # what the runtime calibration sweep ran). With ``dp × ep`` ranks
-        # sharing the data dim, each rank gets ``micro_bsz // (dp × ep)``
-        # samples per microbatch step.
+        # ``micro_bsz`` is the per-stage microbatch size (samples per
+        # forward-backward step at ONE PP stage), where each rank within
+        # the data-dim-sharing group (``dp × ep``) holds
+        # ``micro_bsz // (dp × ep)`` samples — the **per-rank micro-batch
+        # size**, which must be ≥ 1 (you can't fractionally split a
+        # sample across ranks).
+        #
+        # ``num_microbatches = global_bsz // micro_bsz`` is the count of
+        # microbatches that flow through the pipeline per training step.
+        #
+        # Default ``micro_bsz = global_bsz`` ⇒ one microbatch per
+        # iteration (back-compat with the original search semantics). To
+        # explore num_microbatches > 1, callers pass ``micro_bsz``
+        # explicitly.
         if micro_bsz is None:
             micro_bsz = global_bsz
-        if global_bsz % micro_bsz != 0:
+        if micro_bsz <= 0 or global_bsz % micro_bsz != 0:
             return SearchResult(
                 cfg=cfg,
                 error=f"global_bsz ({global_bsz}) not divisible by "
-                      f"micro_bsz ({micro_bsz})",
+                f"micro_bsz ({micro_bsz})",
                 num_attention_layers=num_attention_layers,
                 num_expert_layers=num_expert_layers,
             )
         if cfg["dp"] * cfg["ep"] > micro_bsz:
             return SearchResult(
                 cfg=cfg,
-                error=f"dp*ep ({cfg['dp']}*{cfg['ep']}) > micro_bsz " f"({micro_bsz})",
+                error=f"dp*ep ({cfg['dp']}*{cfg['ep']}) > micro_bsz "
+                f"({micro_bsz}); per-rank batch < 1 sample",
                 num_attention_layers=num_attention_layers,
                 num_expert_layers=num_expert_layers,
             )
@@ -378,6 +379,30 @@ class MoESearcher:
                 cfg=cfg,
                 error=f"micro_bsz ({micro_bsz}) not divisible by dp*ep "
                 f"({cfg['dp']}*{cfg['ep']}={cfg['dp']*cfg['ep']})",
+                num_attention_layers=num_attention_layers,
+                num_expert_layers=num_expert_layers,
+            )
+        # Galvatron's relocate_activations path
+        # (galvatron/core/runtime/redistribute.py:_split_along_first_dim_with_sequence_parallel)
+        # batch-dim shards under SBH + sequence_parallel=True at TP-layout
+        # transition boundaries. Under MoE the boundary fires when EP > 1
+        # (tp_of_ep ≠ body TP), and the redistribute group's world_size is
+        # body TP. The post-permute first dim is per-rank batch, so the
+        # check ``per_rank_batch % TP == 0`` must hold.
+        # Empirical regression: 10 configs failed at (PP=1, TP=2, EP=2,
+        # gbsz=2) per_rank=1 + TP=2 with assertion "First dimension of the
+        # tensor should be divisible by tensor parallel size". See task #47
+        # / cost_model_real_test_gap_fill.sh failures.
+        per_rank_micro_bsz = micro_bsz // (cfg["dp"] * cfg["ep"])
+        if cfg["ep"] > 1 and cfg["tp"] > 1 and per_rank_micro_bsz % cfg["tp"] != 0:
+            return SearchResult(
+                cfg=cfg,
+                error=(
+                    f"per_rank_micro_bsz ({per_rank_micro_bsz}) not "
+                    f"divisible by TP ({cfg['tp']}) under EP>1 + TP>1 + "
+                    f"sequence_parallel — relocate_activations would trip "
+                    f"FSDP/SBH first-dim assertion"
+                ),
                 num_attention_layers=num_attention_layers,
                 num_expert_layers=num_expert_layers,
             )
@@ -438,9 +463,9 @@ class MoESearcher:
         num_attention_layers: Optional[int] = None,
         num_expert_layers: Optional[int] = None,
         num_stages_behind: int = 0,
-        micro_bsz: Optional[int] = None,
         sort_key: Optional[Callable[[SearchResult], Any]] = None,
         configs: Optional[Iterable[Dict[str, Any]]] = None,
+        micro_bsz: Optional[int] = None,
     ) -> RankedSearch:
         """Enumerate the structural config space, score each entry,
         apply feasibility filters, return a sorted :class:`RankedSearch`.

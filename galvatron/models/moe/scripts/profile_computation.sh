@@ -43,13 +43,7 @@ export CUDA_HOME='/usr/local/cuda-12.1'
 
 # MPS bypass — see CLAUDE.md (project memory). SIGKILL'd ranks otherwise
 # leave dirty contexts on the host's GPUs for tens of minutes.
-export CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY:-/tmp/no-such-mps}
-
-# Disable inductor's compile-worker warm pool — it forks /dev/nvidia*
-# FDs into worker processes which makes subsequent set_device() in the
-# inner torchrun fail. profiler.py never uses torch.compile in a hot
-# path so disabling is free. See doc/profile_computation_frozen_fixes.md.
-export TORCHINDUCTOR_COMPILE_THREADS=1
+# export CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY:-/tmp/no-such-mps}
 
 # Disable LAER online re-planning during the FSEP-off baseline so
 # per-layer time stays stationary (linear-fit assumption). The
@@ -76,7 +70,6 @@ echo "Using static input tensor: ${STATIC_INPUT_PATH}"
 MODEL_ARGS="
     --model_size qwen-30b-a3b-e128k8 \
     --set_model_config_manually 0 \
-    --set_layernum_manually 1 \
     --vocab_size 151936 \
     --hidden_size 2048 \
     --num_attention_heads 32 \
@@ -93,8 +86,9 @@ PROFILE_ARGS="
     --profile_max_batch_size 4 \
     --profile_batch_size_step 1 \
     --profile_seq_length_list 4096 \
-    --layernum_min 1 \
-    --layernum_max 2 \
+    --mlp_profile_mode prof_mlp \
+    --layernum_min 2 \
+    --layernum_max 4 \
     --mixed_precision bf16 \
     --use-flash-attn \
     --static_input \

@@ -25,6 +25,15 @@ def galvatron_profile_args(parser):
         help="Whether to set layernum config manually (doesn't overwrite other model configs).",
     )
     group.add_argument(
+        "--mlp_profile_mode",
+        choices=["prof_mlp", "prof_all"],
+        default="prof_all",
+        help="Selects MoE-MLP profiling variant when --profile_unit=mlp. "
+        "'prof_all' (recommended) builds the real per-rank expert stack so "
+        "the cost-model's mlp slope matches FSEP-off training. "
+        "'prof_mlp' uses the legacy single dense ParallelMLP (undercounts).",
+    )
+    group.add_argument(
         "--set_experts_manually",
         type=int,
         default=0,

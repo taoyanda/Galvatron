@@ -1,3 +1,9 @@
+"""
+Default profiling/training script for LAER-MoE with:
+- profiling hooks for Solver init, cost-model validation and config search,
+- static input support for deterministic routing with synthetic batch.
+- 
+"""
 import os
 import atexit
 import faulthandler
@@ -294,38 +300,35 @@ def train(args):
     # prints emitted from MoEAlltoAllSmartTokenDispatcher.
     # ============================================================
     if rank == 0:
-        try:
-            use_fsep = bool(getattr(args, "use_fsep", False))
-            solver_enabled = os.environ.get("ENABLE_SOLVER", "0") == "1"
-            freeze_iter = int(getattr(args, "laer_freeze_after_iter", -1))
-            ep_deg = int(getattr(args, "global_ep_deg", 1))
-            tp_of_ep = int(getattr(args, "global_tp_of_ep_deg", 1))
-            cap = int(getattr(args, "expert_capacity_per_device", 0))
-            n_moe_layers = 0
-            dispatcher_cls = None
-            for m in model.modules():
-                td = getattr(m, "token_dispatcher", None)
-                if td is not None:
-                    n_moe_layers += 1
-                    if dispatcher_cls is None:
-                        dispatcher_cls = type(td).__name__
-            print("=" * 64, flush=True)
-            print(
-                f"[fsep_verify] use_fsep={use_fsep}  solver_enabled={solver_enabled}",
-                flush=True,
-            )
-            print(
-                f"[fsep_verify] dispatcher={dispatcher_cls}  moe_layers={n_moe_layers}",
-                flush=True,
-            )
-            print(
-                f"[fsep_verify] ep_deg={ep_deg} tp_of_ep_deg={tp_of_ep} cap_per_device={cap}",
-                flush=True,
-            )
-            print(f"[fsep_verify] laer_freeze_after_iter={freeze_iter}", flush=True)
-            print("=" * 64, flush=True)
-        except Exception as _e:
-            print(f"[fsep_verify] failed: {_e}", flush=True)
+        use_fsep = bool(getattr(args, "use_fsep", False))
+        solver_enabled = os.environ.get("ENABLE_SOLVER", "0") == "1"
+        freeze_iter = int(getattr(args, "laer_freeze_after_iter", -1))
+        ep_deg = int(getattr(args, "global_ep_deg", 1))
+        tp_of_ep = int(getattr(args, "global_tp_of_ep_deg", 1))
+        cap = int(getattr(args, "expert_capacity_per_device", 0))
+        n_moe_layers = 0
+        dispatcher_cls = None
+        for m in model.modules():
+            td = getattr(m, "token_dispatcher", None)
+            if td is not None:
+                n_moe_layers += 1
+                if dispatcher_cls is None:
+                    dispatcher_cls = type(td).__name__
+        print("=" * 64, flush=True)
+        print(
+            f"[fsep_verify] use_fsep={use_fsep}  solver_enabled={solver_enabled}",
+            flush=True,
+        )
+        print(
+            f"[fsep_verify] dispatcher={dispatcher_cls}  moe_layers={n_moe_layers}",
+            flush=True,
+        )
+        print(
+            f"[fsep_verify] ep_deg={ep_deg} tp_of_ep_deg={tp_of_ep} cap_per_device={cap}",
+            flush=True,
+        )
+        print(f"[fsep_verify] laer_freeze_after_iter={freeze_iter}", flush=True)
+        print("=" * 64, flush=True)
 
     if local_rank == 0:
         print("Start training...")
@@ -385,7 +388,6 @@ def train(args):
                     cached_batch = _maybe_load_deterministic_batch(
                         args, batch, device
                     )
-                else:
                     batch = cached_batch
             tokens, kwargs, loss_func = batch
             # Replicate input tokens across WORLD so the LP solver and MoE
@@ -396,8 +398,7 @@ def train(args):
             profiler.profile_time_start(iter)
             profiler.profile_memory(iter, "Before Forward")
 
-            input_ids = tokens
-            batch = [input_ids]
+            batch = [tokens]
 
             if rank == 0 and iter == _MEM_ITER and not _mem_logged:
                 torch.cuda.synchronize()
@@ -463,6 +464,11 @@ def train(args):
             # against in that mode.
             if not _rm_act_logged and rank == 0:
                 _peak_mb = torch.cuda.max_memory_allocated() / 1e6
+                # Reserved peak — what nvidia-smi sees at the device
+                # level (modulo CUDA context overhead). Typically larger
+                # than allocated due to caching-allocator fragmentation;
+                # the gap grows with chunks > 1 + synchronous grad reduce.
+                _peak_reserved_mb = torch.cuda.max_memory_reserved() / 1e6
                 _opt_actual_mb = (
                     sum(
                         t.numel() * t.element_size()
@@ -476,7 +482,8 @@ def train(args):
                 print(
                     f"[real_measure] optimizer_mb={_opt_actual_mb:.2f} "
                     f"activation_peak_mb={_act_peak_mb:.2f} "
-                    f"cuda_peak_mb={_peak_mb:.2f}",
+                    f"cuda_peak_mb={_peak_mb:.2f} "
+                    f"cuda_peak_reserved_mb={_peak_reserved_mb:.2f}",
                     flush=True,
                 )
                 _rm_act_logged = True

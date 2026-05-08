@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
-# Real-measurement sweep for cost-model validation.
-# Runs train_dist_random.py for each of the 6 valid (dp, tp, ep) configs on a
-# 4-GPU node with 4 layers, capturing per-config logs that contain:
+# Real-measurement sweep for cost-model validation on Qwen3-30B-A3B
+# (128 experts, top-k=8) on 4 GPUs. Runs train_dist_frozen.py (which
+# handles PP correctly under --static_input by auto-loading the per-bsz
+# deterministic batch from static_inputs/{model_size}_bs{N}_{precision}.pt)
+# for each valid (pp, tp, ep, dp_mode, bsz, fsep) config with NUM_LAYERS layers,
+# capturing per-config logs that contain:
 #   - [real_measure] params_mb=…
 #   - [real_measure] optimizer_mb=… activation_peak_mb=… cuda_peak_mb=…
 #   - Average iteration time is: X s
-# Logs land in galvatron/models/moe/logs/cost_model_real_<dp>_<tp>_<ep>.log.
+# Logs land in galvatron/models/moe/logs/cost_model_real_*.log.
+#
+# Trainer choice: train_dist_frozen.py (NOT train_dist_random.py).
+# train_dist_random.py caches the first random batch in-memory, which
+# means tokens shift between runs and FSEP-on vs FSEP-off comparisons
+# aren't apples-to-apples; train_dist_frozen.py pulls deterministic
+# tokens from the per-bsz files, so the speedup we quote is reproducible.
 #
 # Same NCCL/MPS env recipe as profile_computation_frozen.sh — see
 # doc/laer_fsep_sweep_resolution.md.
 #
 # Usage:
-#   bash galvatron/models/moe/scripts/cost_model_real_test.sh           # all 6
-#   bash galvatron/models/moe/scripts/cost_model_real_test.sh dp tp ep  # one
+#   bash galvatron/models/moe/scripts/cost_model_real_test.sh                   # full sweep
+#   bash galvatron/models/moe/scripts/cost_model_real_test.sh pp tp ep dp bsz fsep  # one config
 set -euo pipefail
 
 export NUM_NODES=1
@@ -32,6 +41,23 @@ export CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY:-/tmp/no-such-mps}
 # ring construction failures for full-world DP groups.
 export TORCHINDUCTOR_COMPILE_THREADS=1
 
+# Cross-NUMA NCCL ring-construction workaround. On the 2×2-island PCIe-A100
+# fabric, NCCL's multi-channel ring builder produces an inconsistent layout
+# whenever a collective spans both islands (raw_dp > island_size), wedging
+# the rank with a "ring 1 does not loop back to start" error. Detect the
+# island size once here; later, per-config, we prepend NCCL_P2P_DISABLE=1
+# to the inner torchrun whenever raw_dp > island_size. Configs that fit in
+# one island stay on default NCCL transports (intra-island NVLink intact).
+# See doc/cross_numa_nccl_postmortem.md for the full investigation.
+SCRIPT_DIR_FOR_DETECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_world=$(( NUM_NODES * NUM_GPUS_PER_NODE ))
+_island=$(python3 "${SCRIPT_DIR_FOR_DETECT}/detect_p2p_island_size.py" 2>/dev/null || echo 0)
+if [ "${_island}" -gt 0 ] && [ "${_island}" -lt "${_world}" ]; then
+    export GALVATRON_P2P_ISLAND_SIZE=${_island}
+    echo "[p2p] detected island_size=${_island} world=${_world}; will prepend NCCL_P2P_DISABLE=1 for raw_dp>island launches"
+fi
+unset _world _island SCRIPT_DIR_FOR_DETECT
+
 # Match production training's FSEP-required envelope (see train.sh):
 #   - TORCH_NCCL_AVOID_RECORD_STREAMS=1: FSEP overrides manage tensor
 #     lifetimes via custom events; PyTorch's auto record-stream double-
@@ -44,55 +70,134 @@ export ENABLE_SOLVER=${ENABLE_SOLVER:-1}
 
 NUM_LAYERS=${NUM_LAYERS:-4}
 SEQ_LEN=4096
-# Pipeline parallelism degree. With ``PP=1`` the layout matches the
-# original sweep; for ``PP>1`` the per-stage world size becomes
-# tp×ep×dp = NUM_GPUS_PER_NODE/PP, so the caller must pick (TP, EP, DP_MODE)
-# such that the per-stage product fits.
-PP=${PP:-1}
 EPOCHS=20  # need ≥20 iters: profiler averages [10, 20), and we sample the
             # memory-evolution snapshot at iter 10.
+# CHUNKS controls the number of microbatches per training iteration. The
+# matrix tuple's "bsz" column is the per-stage compute batch size
+# (micro_bsz); the trainer's global_train_batch_size is then
+# ``micro_bsz × CHUNKS`` so each microbatch matches the calibration
+# anchor at chunks=1. CHUNKS>1 also forces ``--no_async_grad_reduce``
+# under FSEP-off (FSEP-on already requires it) — without it FSDP trips
+# the ``_saved_grad_shard`` assertion at end-of-iteration grad finalize.
+CHUNKS=${CHUNKS:-1}
 
-# FSEP-viable parallelization envelope on 4 GPUs:
-#     tp * ep == world_size  AND  tp == tp_of_ep_deg
-# This collapses the 6-tuple matrix to two configs:
-#     (tp=1, ep=4): one EP shard per rank, no TP within experts
-#     (tp=2, ep=2): two EP shards × two TP-within-EP ranks per shard
-# DP comes from --sdp 1 + --sequence-parallel (sequence-data-parallel) when
-# --default_dp_type zero2 is used; under zero3 it comes from FSDP itself
-# sharding params across all ranks.
-#
-# We sweep both DP modes for each FSEP config, plus bsz ∈ {2, 4}. Tuple
-# format: "tp ep dp_mode bsz"  with dp_mode ∈ {zero2sdp, zero3}.
-DEFAULT_CONFIGS=(
-    # "tp ep dp_mode bsz fsep"  (fsep ∈ {on, off})
+# Qwen3-30B-A3B (128 experts, top-k=8) on 4 GPUs. Cost-model calibration
+# sweeps over (pp, tp, ep, dp_mode, bsz, fsep). Only PP ∈ {1, 2} per
+# user directive (PP=4 would put one layer per stage and overshoot the
+# cost-model's PP-aware aggregator).
+NUM_GLOBAL_EXPERTS=128
+
+# Validity rules on world=4:
+#   - per-stage world = world / pp must accommodate tp × ep × dp_per_stage
+#   - FSEP-on requires tp == tp_of_ep AND dp_of_ep_size > 1
+#     (= world/(pp*tp) > 1, i.e. pp*tp < world). When pp*tp == world the
+#     FSDP-EP group degenerates to a single rank and the FSEP all-to-all
+#     kernel returns NULL on backward — those tuples are excluded from
+#     the FSEP-on track.
+#   - FSEP-off has no FSEP-shape constraint. Standard Megatron MoE alltoall
+#     handles ep > 1 fine, and train_dist_frozen.py keeps the rest of the
+#     pipeline + FSDP collective sequence well-behaved (verified by step 4
+#     successfully running pp=2 and tp=4 configs with zero3+SP+sdp). So
+#     for every (pp, tp, ep) tuple, FSEP-off rows sweep both zero3 and
+#     zero2sdp.
+# A sister script can override the base matrix by setting
+# ``CONFIGS_BASE_OVERRIDE`` to a newline-separated string of 6-tuples
+# before sourcing this file — used by ``cost_model_real_test_gap_fill.sh``
+# to add gbsz=1/2 calibration entries without re-running the main matrix.
+if [ -n "${CONFIGS_BASE_OVERRIDE:-}" ]; then
+    # ``mapfile -t`` reads one line per array element, stripping the
+    # trailing newline. Tuples must already be space-separated internally
+    # (same format as the default array entries below).
+    mapfile -t DEFAULT_CONFIGS_BASE <<< "${CONFIGS_BASE_OVERRIDE}"
+    echo "[matrix] using CONFIGS_BASE_OVERRIDE (${#DEFAULT_CONFIGS_BASE[@]} configs)"
+else
+DEFAULT_CONFIGS_BASE=(
+    # "pp tp ep dp_mode micro_bsz fsep"  (dp_mode = zero2sdp, fsep ∈ {on, off})
     #
-    # FSEP-on track: smart routing + LAER solver, requires tp × ep ==
-    # world_size AND tp == tp_of_ep_deg. On 4 GPUs that means (tp=1, ep=4)
-    # and (tp=2, ep=2). Both DP modes the user supports for FSDP:
-    # zero2+sdp and zero3.
-    "1 4 zero2sdp 4 on"  "1 4 zero2sdp 8 on"
-    "1 4 zero3    4 on"  "1 4 zero3    8 on"
-    "2 2 zero2sdp 4 on"  "2 2 zero2sdp 8 on"
-    "2 2 zero3    4 on"  "2 2 zero3    8 on"
-    # FSEP-off track for the SAME (tp, ep) shapes — naive Megatron MoE
-    # all-to-all + plain FSDP (no LAER, no smart routing). Run head-to-head
-    # against the FSEP-on rows above so we can quote a real speedup.
-    "1 4 zero2sdp 4 off"  "1 4 zero2sdp 8 off"
-    "1 4 zero3    4 off"  "1 4 zero3    8 off"
-    "2 2 zero2sdp 4 off"  "2 2 zero2sdp 8 off"
-    "2 2 zero3    4 off"  "2 2 zero3    8 off"
-    # FSEP-off track for ep=1 (FSEP can't satisfy its constraint here).
-    # Lets us cover bsz=2 / smaller tp combos that bsz=4 doesn't.
-    "2 1 zero2sdp 2 off"  "2 1 zero2sdp 4 off"
-    "2 1 zero3    2 off"  "2 1 zero3    4 off"
-    "4 1 zero2sdp 4 off"
-    "4 1 zero3    4 off"
+    # zero3 was dropped from the default matrix per project decision —
+    # empirically it was uniformly slower than zero2sdp (4-15% on
+    # full-iter, more on MLP-only) at identical memory peaks, with no
+    # case where it was preferable. Existing zero3 calibration entries
+    # in the runtime profile remain valid; we just don't extend them.
+    #
+    # The "micro_bsz" column is the per-stage compute batch size (=
+    # trainer's global_train_batch_size when CHUNKS=1; CHUNKS>1 doubles
+    # gbsz to keep the per-microbatch shape identical to the chunks=1
+    # anchor).
+    #
+    # === PP=1 FSEP-on (dp_of_ep > 1) ===
+    "1 1 1 zero2sdp 4 on"
+    "1 1 2 zero2sdp 4 on"
+    "1 1 4 zero2sdp 4 on"
+    "1 2 1 zero2sdp 4 on"
+    "1 2 2 zero2sdp 4 on"
+    # (1 4 1 ...) FSEP-on excluded — dp_of_ep_size=1 (degenerate)
+    #
+    # === PP=1 FSEP-off (full (tp, ep) matrix) ===
+    "1 1 1 zero2sdp 4 off"
+    "1 1 2 zero2sdp 4 off"
+    "1 1 4 zero2sdp 4 off"
+    "1 2 1 zero2sdp 4 off"
+    "1 2 2 zero2sdp 4 off"
+    "1 4 1 zero2sdp 4 off"
+    #
+    # === PP=2 FSEP-on (per-stage world=2; dp_of_ep > 1 → tp=1) ===
+    "2 1 1 zero2sdp 4 on"
+    "2 1 2 zero2sdp 4 on"
+    # (2 2 1 ...) FSEP-on excluded — dp_of_ep = 4/(2*2) = 1 (degenerate)
+    #
+    # === PP=2 FSEP-off (full (tp, ep) matrix that fits per-stage=2) ===
+    "2 1 1 zero2sdp 4 off"
+    "2 1 2 zero2sdp 4 off"
+    "2 2 1 zero2sdp 4 off"
 )
+fi
 
-if [ "$#" -eq 5 ]; then
-    CONFIGS=("$1 $2 $3 $4 $5")
+# Profile-unit expansion: each base 6-tuple gets fanned out into per-component
+# rows so the cost-model gets per-shape attention/MLP/full breakdown end-to-end
+# (forward + backward + optimizer). This obsoletes step 6's forward-only
+# per-block compute profile and removes the `bwd_mult` coefficient from
+# downstream predictions — the backward time is measured directly.
+#
+# Skip rules:
+#   - (profile_unit=attention, fsep=on): redundant. The attention-only model
+#     instantiates ``MoELayer_attention`` which has no MoE/router/dispatcher,
+#     so FSEP-on and FSEP-off are byte-identical for attention. We collapse
+#     to fsep=off only.
+#   - (profile_unit=mlp): kept for both fsep ∈ {on, off} — this is where the
+#     FSEP overhead lives, and we want shape-dependent on/off deltas.
+#   - (profile_unit=all): kept for both fsep ∈ {on, off} — top-line numbers
+#     used by the cost model's primary lookup.
+#
+# Set DEFAULT_PROFILE_UNITS to override (e.g. "all" for legacy single-pass).
+DEFAULT_PROFILE_UNITS=${DEFAULT_PROFILE_UNITS:-"all attention mlp"}
+
+DEFAULT_CONFIGS=()
+for tuple in "${DEFAULT_CONFIGS_BASE[@]}"; do
+    read -r _pp _tp _ep _dp _bsz _fsep <<< "${tuple}"
+    for unit in ${DEFAULT_PROFILE_UNITS}; do
+        # FSEP-on attention is redundant with fsep-off attention (no MoE).
+        if [ "${unit}" = "attention" ] && [ "${_fsep}" = "on" ]; then
+            continue
+        fi
+        DEFAULT_CONFIGS+=("${_pp} ${_tp} ${_ep} ${_dp} ${_bsz} ${_fsep} ${unit}")
+    done
+done
+unset _pp _tp _ep _dp _bsz _fsep
+
+# Per-config arg parsing.
+# 7-tuple: (pp, tp, ep, dp_mode, bsz, fsep, profile_unit) — full control.
+# 6-tuple: (pp, tp, ep, dp_mode, bsz, fsep) → profile_unit defaulted to "all".
+# 5-tuple legacy: (tp, ep, dp_mode, bsz, fsep) → pp=1, profile_unit="all".
+# 4-tuple legacy: (tp, ep, dp_mode, bsz) → pp=1, fsep=on, profile_unit="all".
+if [ "$#" -eq 7 ]; then
+    CONFIGS=("$1 $2 $3 $4 $5 $6 $7")
+elif [ "$#" -eq 6 ]; then
+    CONFIGS=("$1 $2 $3 $4 $5 $6 all")
+elif [ "$#" -eq 5 ]; then
+    CONFIGS=("1 $1 $2 $3 $4 $5 all")
 elif [ "$#" -eq 4 ]; then
-    CONFIGS=("$1 $2 $3 $4 on")
+    CONFIGS=("1 $1 $2 $3 $4 on all")
 else
     CONFIGS=("${DEFAULT_CONFIGS[@]}")
 fi
@@ -100,7 +205,12 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LOG_DIR="${MODEL_DIR}/logs"
-STATIC_INPUT_PATH="${MODEL_DIR}/static_inputs/frozen_batch_comp.pt"
+# Dead arg — train_dist_frozen.py auto-resolves the deterministic batch
+# via `static_inputs/{model_size}_bs{N}_{precision}.pt` per per-rank bsz;
+# `--static_input_path` is never consulted. Default to the bs1 file just
+# so the path argparse sees is real (and so we don't lie about which
+# file is "in use" — the trainer auto-resolver still wins).
+STATIC_INPUT_PATH="${MODEL_DIR}/static_inputs/qwen-30b-a3b-e128k8_bs1_bf16.pt"
 mkdir -p "${LOG_DIR}"
 
 LAUNCHER="torchrun --nnodes ${NUM_NODES} --nproc_per_node ${NUM_GPUS_PER_NODE} --master_port ${MASTER_PORT}"
@@ -114,9 +224,21 @@ echo "[env] ENABLE_SOLVER=${ENABLE_SOLVER}"
 cd "${MODEL_DIR}"
 
 for tuple in "${CONFIGS[@]}"; do
-    read -r TP EP DP_MODE GLOBAL_BSZ FSEP_MODE <<< "${tuple}"
+    # The matrix tuple's "bsz" column is now the per-stage micro_bsz
+    # (= trainer's gbsz at chunks=1). At CHUNKS>1 we double gbsz to keep
+    # micro_bsz fixed. Read into MICRO_BSZ for clarity.
+    read -r PP TP EP DP_MODE MICRO_BSZ FSEP_MODE PROFILE_UNIT <<< "${tuple}"
     FSEP_MODE=${FSEP_MODE:-on}
-    CAP=$((8 / EP))  # global_experts=8 for mixtral-8x7b-e8k2
+    PROFILE_UNIT=${PROFILE_UNIT:-all}
+    GLOBAL_BSZ=$(( MICRO_BSZ * CHUNKS ))
+    # FSEP-on attention is byte-identical to FSEP-off attention (the
+    # attention-only model class has no MoE). Skip the redundant row even
+    # when an explicit 7-tuple specifies it.
+    if [ "${PROFILE_UNIT}" = "attention" ] && [ "${FSEP_MODE}" = "on" ]; then
+        echo "[skip] profile_unit=attention fsep=on is redundant with fsep=off"
+        continue
+    fi
+    CAP=$((NUM_GLOBAL_EXPERTS / EP))  # 128 / EP for Qwen3-30B-A3B
     if [ "${DP_MODE}" = "zero2sdp" ]; then
         DP_TYPE_FLAG="zero2"
         SDP_FLAG=1
@@ -151,11 +273,30 @@ for tuple in "${CONFIGS[@]}"; do
     else
         FSEP_FLAG=""
         TP_OF_EP=1
-        NO_ASYNC_FLAG=""
+        # FSEP-off async grad reduce is fine at chunks=1 (one microbatch
+        # per iter → no cross-microbatch grad accumulation). At chunks>1,
+        # the async path trips an FSDP `_saved_grad_shard` assertion at
+        # end-of-iter under MoE top-k sparse expert activation: experts
+        # that didn't receive gradients in this iteration leave the
+        # manual ``fsdp_reduce_gradients`` walker without a sharded grad
+        # to finalize. Forcing sync grad reduce sidesteps that path
+        # (real training under chunks>1 + MoE has to do the same).
+        if [ "${CHUNKS}" -gt 1 ]; then
+            NO_ASYNC_FLAG="--no_async_grad_reduce"
+        else
+            NO_ASYNC_FLAG=""
+        fi
     fi
     # Default log path matches the original calibration sweep
-    # (NUM_LAYERS=4, PP=1). Non-default values are tagged in the filename
-    # so each variant has its own log.
+    # (NUM_LAYERS=4, PP=1, profile_unit=all). Non-default values are tagged
+    # in the filename so each variant has its own log. Legacy logs without
+    # ``_unit{X}`` are read by the aggregator as ``profile_unit="all"`` for
+    # backwards compatibility.
+    # Filename uses the trainer's gbsz (= MICRO_BSZ × CHUNKS), matching the
+    # ``--global_train_batch_size`` argument actually passed in. The
+    # aggregator recovers ``micro_bsz = gbsz / chunks`` for shape-key
+    # construction. Legacy logs without ``_chunks{N}`` are interpreted as
+    # chunks=1 by the aggregator (back-compat).
     LOG_PATH="${LOG_DIR}/cost_model_real_tp${TP}_ep${EP}_${DP_MODE}_bsz${GLOBAL_BSZ}_fsep${FSEP_MODE}"
     if [ "${NUM_LAYERS}" != "4" ]; then
         LOG_PATH="${LOG_PATH}_nl${NUM_LAYERS}"
@@ -163,42 +304,60 @@ for tuple in "${CONFIGS[@]}"; do
     if [ "${PP}" != "1" ]; then
         LOG_PATH="${LOG_PATH}_pp${PP}"
     fi
+    if [ "${CHUNKS}" != "1" ]; then
+        LOG_PATH="${LOG_PATH}_chunks${CHUNKS}"
+    fi
+    if [ "${PROFILE_UNIT}" != "all" ]; then
+        LOG_PATH="${LOG_PATH}_unit${PROFILE_UNIT}"
+    fi
     LOG_PATH="${LOG_PATH}.log"
 
     # Per-config throw-away MPS pipe dir to ensure no MPS control-socket
     # state can leak between configs.
-    PER_RUN_MPS_DIR="/tmp/no-such-mps-${TP}-${EP}-${DP_MODE}-${GLOBAL_BSZ}-$$"
+    PER_RUN_MPS_DIR="/tmp/no-such-mps-${TP}-${EP}-${DP_MODE}-${GLOBAL_BSZ}-${PROFILE_UNIT}-$$"
     rm -rf "${PER_RUN_MPS_DIR}" 2>/dev/null || true
     export CUDA_MPS_PIPE_DIRECTORY="${PER_RUN_MPS_DIR}"
 
+    # Per-config NCCL P2P workaround: if this config's raw_dp (= world /
+    # (pp * tp)) exceeds the detected island size, set NCCL_P2P_DISABLE=1
+    # for the inner torchrun. We use a NCCL_ENV array passed to ``env``
+    # because bash only honours the literal `VAR=value cmd` env-prefix
+    # syntax in source text — after parameter expansion it'd be parsed as
+    # a command name (rc=127). See doc/cross_numa_nccl_postmortem.md.
+    NCCL_ENV=()
+    raw_dp=$(( NUM_GPUS_PER_NODE * NUM_NODES / (PP * TP) ))
+    if [ "${GALVATRON_P2P_ISLAND_SIZE:-0}" -gt 0 ] && [ "${raw_dp}" -gt "${GALVATRON_P2P_ISLAND_SIZE}" ]; then
+        NCCL_ENV=("NCCL_P2P_DISABLE=1")
+    fi
+
     echo "========================================================"
-    echo "  cost_model_real: pp=${PP} tp=${TP} ep=${EP} dp_mode=${DP_MODE} bsz=${GLOBAL_BSZ} fsep=${FSEP_MODE} nl=${NUM_LAYERS}"
+    echo "  cost_model_real: pp=${PP} tp=${TP} ep=${EP} dp_mode=${DP_MODE} bsz=${GLOBAL_BSZ} chunks=${CHUNKS} fsep=${FSEP_MODE} unit=${PROFILE_UNIT} nl=${NUM_LAYERS} ${NCCL_ENV[*]:+(P2P_DISABLE)}"
     echo "  log: ${LOG_PATH}"
     echo "========================================================"
 
     rc=0
-    timeout --kill-after=120 1200 \
-        ${LAUNCHER} train_dist_random.py \
+    env "${NCCL_ENV[@]}" timeout --kill-after=120 1200 \
+        ${LAUNCHER} train_dist_frozen.py \
             --profile_mode batch --shape_order SBH --dropout_prob 0.0 \
             ${FSEP_FLAG} \
             --global_ep_deg ${EP} \
             --global_tp_of_ep_deg ${TP_OF_EP} \
             --expert_capacity_per_device ${CAP} \
-            --profile_unit all \
+            --profile_unit ${PROFILE_UNIT} \
             --set_experts_manually 0 \
-            --model_size mixtral-8x7b-e8k2 \
-            --hidden_size 4096 --intermediate_size 14336 --head_dim 128 \
-            --num_attention_heads 32 --num_experts_per_tok 2 \
-            --num_key_value_heads 8 --num_local_experts 8 \
-            --vocab_size 32000 --rms_norm_eps 1e-05 --rope_theta 1000000.0 \
-            --router_aux_loss_coef 0.0 --is_moe_model \
+            --model_size qwen-30b-a3b-e128k8 \
+            --hidden_size 2048 --intermediate_size 768 --head_dim 64 \
+            --num_attention_heads 32 --num_experts_per_tok 8 \
+            --num_key_value_heads 4 --num_local_experts ${NUM_GLOBAL_EXPERTS} \
+            --vocab_size 151936 --rms_norm_eps 1e-06 --rope_theta 10000000.0 \
+            --router_aux_loss_coef 0.001 --is_moe_model \
             --set_model_config_manually 0 --set_layernum_manually 1 --set_seqlen_manually 1 \
             --global_train_batch_size ${GLOBAL_BSZ} \
             --epochs ${EPOCHS} --lr 0.0001 --adam_weight_decay 0.01 \
             --check_loss 0 --profile 1 --save_profiled_memory 0 \
             --profile_forward 0 --initialize_on_meta 1 \
             ${NO_ASYNC_FLAG} \
-            --global_tp_consec ${TP_CONSEC} --sdp ${SDP_FLAG} --chunks 1 \
+            --global_tp_consec ${TP_CONSEC} --sdp ${SDP_FLAG} --chunks ${CHUNKS} \
             --pipeline_type ${PIPELINE_TYPE} --default_dp_type ${DP_TYPE_FLAG} \
             --mixed_precision bf16 \
             ${SP_FLAG} \
@@ -212,13 +371,13 @@ for tuple in "${CONFIGS[@]}"; do
             > "${LOG_PATH}" 2>&1 || rc=$?
 
     if [ "${rc}" -ne 0 ]; then
-        echo "[cost_model_real] tp=${TP} ep=${EP} dp_mode=${DP_MODE} bsz=${GLOBAL_BSZ} fsep=${FSEP_MODE} FAILED rc=${rc} — check ${LOG_PATH}"
-        pkill -KILL -f "train_dist_random.py" 2>/dev/null || true
+        echo "[cost_model_real] pp=${PP} tp=${TP} ep=${EP} dp_mode=${DP_MODE} bsz=${GLOBAL_BSZ} fsep=${FSEP_MODE} unit=${PROFILE_UNIT} FAILED rc=${rc} — check ${LOG_PATH}"
+        pkill -KILL -f "train_dist_frozen.py" 2>/dev/null || true
         pkill -KILL -f "torchrun" 2>/dev/null || true
         sleep 10  # let driver state quiesce before next config
         # don't abort the whole sweep — record per-config failure and proceed
     else
-        echo "[cost_model_real] tp=${TP} ep=${EP} dp_mode=${DP_MODE} bsz=${GLOBAL_BSZ} fsep=${FSEP_MODE} OK"
+        echo "[cost_model_real] pp=${PP} tp=${TP} ep=${EP} dp_mode=${DP_MODE} bsz=${GLOBAL_BSZ} fsep=${FSEP_MODE} unit=${PROFILE_UNIT} OK"
         sleep 2
     fi
     # Clean the per-run MPS pipe dir whether the run succeeded or failed.

@@ -728,6 +728,48 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
         self.global_expert_indices = result.get("expert_placement")
         self.global_expert_locations = result.get("global_expert_locations")
         self.inverse_expert_map = result.get("inverse_expert_map")
+        # The LP solver produces expert_placement of shape [ep_size, cap]
+        # (n_device == ep_size in async_linear_programming.py:77). Under
+        # FSEP the all-to-all kernel iterates [dp_of_ep_size, cap] with
+        # dp_of_ep_size == fsdp_handle.world_size, which can exceed
+        # ep_size (e.g. ep=1 cap=128 dp_of_ep=4 → kernel reads 512 entries
+        # but solver returns only 128). Build the world-shaped placement
+        # via gather: world_placement[r] = ep_placement[ep_rank(r)].
+        #
+        # ep_rank(local_rank) within an FSDP-EP group, derived from
+        # gen_ep_group_dist (comm_groups.py:181-191):
+        #     within_dp_cell = local_rank % (ep_size * tp_of_ep)
+        #     ep_rank        = within_dp_cell // tp_of_ep
+        # — striped (r % ep_size) when tp_of_ep == 1, but consecutive in
+        # tp_of_ep-sized chunks when tp_of_ep > 1. A naive repeat() or
+        # repeat_interleave() only matches one of those cases, so we use
+        # an index gather that is correct for any (ep, tp_of_ep, pp).
+        #
+        # Only the kernel-bound `global_placement` is reshaped —
+        # `global_expert_indices_numpy` (used for solver feedback) and
+        # `global_expert_locations` / `inverse_expert_map` (consumed by the
+        # dispatcher's routing path at their original ep-keyed shapes) are
+        # left untouched.
+        fsdp_world_size = getattr(self.fsdp_handle, "world_size", None)
+        if fsdp_world_size is not None and self.global_expert_indices is not None:
+            placement = self.global_expert_indices
+            ep_rows = placement.shape[0] if placement.dim() >= 1 else 1
+            if ep_rows != fsdp_world_size:
+                assert fsdp_world_size % ep_rows == 0, (
+                    f"FSDP world_size ({fsdp_world_size}) must be a multiple of "
+                    f"the LP solver's ep_size ({ep_rows}); got placement shape "
+                    f"{tuple(placement.shape)}"
+                )
+                # ep_rank(local) within an FSDP-EP group is local % ep_size
+                # — verified empirically (see comment in MoEMLP_tp.__init__
+                # in MoEModel_tensor_parallel.py for derivation + log
+                # reference). Equivalent to placement.repeat(R, 1) but the
+                # gather form is more explicit about intent.
+                local_ranks = torch.arange(
+                    fsdp_world_size, dtype=torch.long, device=placement.device
+                )
+                ep_row_index = local_ranks % ep_rows
+                self.global_expert_indices = placement[ep_row_index].contiguous()
         self.fsdp_handle.global_placement_cpu = self.global_expert_indices
         # self.fsdp_handle.global_expert_locations_cpu = self.global_expert_locations
         # self.fsdp_handle.inverse_expert_map_cpu = self.inverse_expert_map

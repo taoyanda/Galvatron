@@ -30,14 +30,14 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 # the 2×2-island topology breaks multi-channel ring construction for
 # full-world DP groups). The same script also auto-detects the host's
 # P2P-island size; we mirror that detection here so the inner profiler
-# launcher applies ``NCCL_MAX_NCHANNELS=1`` only for ring-spanning
-# inner configs.
+# launcher applies ``NCCL_P2P_DISABLE=1`` only for ring-spanning
+# inner configs (see ``doc/cross_numa_nccl_postmortem.md``).
 SCRIPT_DIR_FOR_DETECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _world=$(( NUM_NODES * NUM_GPUS_PER_NODE ))
 _island=$(python3 "${SCRIPT_DIR_FOR_DETECT}/detect_p2p_island_size.py" 2>/dev/null || echo 0)
 if [ "${_island}" -gt 0 ] && [ "${_island}" -lt "${_world}" ]; then
     export GALVATRON_P2P_ISLAND_SIZE=${_island}
-    echo "[p2p] detected island_size=${_island} world=${_world}; will cap NCCL_MAX_NCHANNELS=1 for dp>island launches"
+    echo "[p2p] detected island_size=${_island} world=${_world}; will prepend NCCL_P2P_DISABLE=1 for raw_dp>island launches"
 fi
 unset _world _island SCRIPT_DIR_FOR_DETECT
 
@@ -57,6 +57,24 @@ export ENABLE_SOLVER=1
 # busy state that fails subsequent set_device() in the inner torchrun.
 export TORCHINDUCTOR_COMPILE_THREADS=1
 
+# Disable torch._dynamo entirely for the memory-profile run. Under
+# zero3 + sequence-parallel + sdp, the megatron `@jit_fuser`-decorated
+# helpers (gelu_impl/erf_gelu/glu in megatron/core/transformer/utils.py
+# + runtime/moe/mlp.py, where jit_fuser == torch.compile) trigger
+# inductor's AOT-autograd path on the very first forward. That path
+# calls preserve_rng_state -> torch.cuda.set_rng_state, which surfaces
+# an asynchronous CUDA illegal-memory-access and aborts the whole
+# inner torchrun before any iter completes.
+#
+# Step 6 doesn't hit this because computation profiling forces ddp+no-SP
+# (model_profiler.py:1252-1256), which keeps the FX graph small enough
+# that dynamo doesn't invoke the inductor backend.
+#
+# We don't need fused kernels for memory profiling — peak-memory numbers
+# only depend on tensor shapes and sharding, not kernel fusion. So we
+# fall back to eager mode for the whole inner trainer.
+export TORCHDYNAMO_DISABLE=1
+
 # Per-inner-config timeout (seconds): each (seq, tp) torchrun launch the
 # profiler issues via os.system() is wrapped in `timeout --kill-after=...`
 # inside model_profiler.py so a hung NCCL collective cannot strand the whole
@@ -66,9 +84,13 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 export GALVATRON_PROFILE_INNER_TIMEOUT=${GALVATRON_PROFILE_INNER_TIMEOUT:-900}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATIC_INPUT_PATH="${STATIC_INPUT_PATH:-${SCRIPT_DIR}/../static_inputs/frozen_batch_mem.pt}"
-mkdir -p "$(dirname "${STATIC_INPUT_PATH}")"
-echo "Using static input tensor: ${STATIC_INPUT_PATH}"
+# train_dist_frozen.py auto-resolves the deterministic batch via
+# `static_inputs/{model_size}_bs{N}_{precision}.pt` per per-rank bsz —
+# `--static_input_path` is dead arg in this profile path. Default to the
+# bs1 file (which exists for Qwen3) so `set -u` stays happy and the
+# argparse arg has a real path; the trainer's auto-resolver still wins.
+STATIC_INPUT_PATH="${STATIC_INPUT_PATH:-${SCRIPT_DIR}/../static_inputs/qwen-30b-a3b-e128k8_bs1_bf16.pt}"
+echo "Using static input tensor: ${STATIC_INPUT_PATH} (note: trainer auto-resolves per-bsz, this path is dead arg)"
 
 # torchrun matches profile_computation_frozen.sh; the deprecated
 # `python3 -m torch.distributed.launch` was the old default.
@@ -77,12 +99,20 @@ LAUNCHER="${LAUNCHER} --nnodes ${NUM_NODES}"
 LAUNCHER="${LAUNCHER} --nproc_per_node ${NUM_GPUS_PER_NODE}"
 
 export PROFILE_LAUNCHER="$LAUNCHER"
-export PROFILE_TRAINER="profile_dist_static.py"
+# Use train_dist_frozen.py (NOT profile_dist_static.py). Both support
+# --static_input, but profile_dist_static.py's iteration loop
+# (`for iter in range(MAX_ITERS): get_batch()`) deadlocks on the very
+# first inter-stage send/recv whenever pp_deg > 1, regardless of FSEP.
+# train_dist_frozen.py iterates a real DataLoaderForMoE which handles
+# the per-PP-stage batch routing correctly (fake_tensor for non-first /
+# non-last stages, real tokens only at stage boundaries). Verified:
+# pp=2 hangs with profile_dist_static.py but completes cleanly with
+# train_dist_frozen.py under the same zero3+SP+sdp+FSEP regime.
+export PROFILE_TRAINER="train_dist_frozen.py"
 
 MODEL_ARGS="
     --model_size qwen-30b-a3b-e128k8 \
     --set_model_config_manually 0 \
-    --set_layernum_manually 1 \
     --vocab_size 151936 \
     --hidden_size 2048 \
     --num_attention_heads 32 \
@@ -151,7 +181,7 @@ for tuple in "${EP_CAP_TUPLES[@]}"; do
         # after a SIGKILL, so the next (EP, CAP) would inherit the
         # corruption and cascade.
         echo "[outer abort] cleaning up stragglers from ep=${EP} cap=${CAP}"
-        pkill -KILL -f "profile_dist_static.py" 2>/dev/null || true
+        pkill -KILL -f "train_dist_frozen.py" 2>/dev/null || true
         pkill -KILL -f "torchrun" 2>/dev/null || true
         sleep 3
         echo "[outer abort] sweep stopped — restart hetu, wait 10 min, then retry the failing config in isolation"

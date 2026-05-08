@@ -34,15 +34,18 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 # whose rank count exceeds an island wedges with "ring N does not
 # contain rank 0". We auto-detect island size at script start; the
 # inner profiler launcher reads ``GALVATRON_P2P_ISLAND_SIZE`` and
-# prepends ``NCCL_MAX_NCHANNELS=1`` to the inner CMD ONLY for inner
-# configs whose dp_deg > island_size — preserving multi-channel for
-# everything that fits and fixing only the ring-spanning shapes.
+# prepends ``NCCL_P2P_DISABLE=1`` to the inner CMD ONLY for inner
+# configs whose raw_dp = world/(pp×tp) > island_size — preserving
+# multi-channel + intra-island NVLink P2P for everything that fits and
+# fixing only the ring-spanning shapes. See
+# ``doc/cross_numa_nccl_postmortem.md`` for why P2P_DISABLE was chosen
+# over NCCL_MAX_NCHANNELS=1 / NCCL_IGNORE_DISABLED_P2P=1.
 SCRIPT_DIR_FOR_DETECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _world=$(( NUM_NODES * NUM_GPUS_PER_NODE ))
 _island=$(python3 "${SCRIPT_DIR_FOR_DETECT}/detect_p2p_island_size.py" 2>/dev/null || echo 0)
 if [ "${_island}" -gt 0 ] && [ "${_island}" -lt "${_world}" ]; then
     export GALVATRON_P2P_ISLAND_SIZE=${_island}
-    echo "[p2p] detected island_size=${_island} world=${_world}; will cap NCCL_MAX_NCHANNELS=1 for dp>island launches"
+    echo "[p2p] detected island_size=${_island} world=${_world}; will prepend NCCL_P2P_DISABLE=1 for raw_dp>island launches"
 fi
 unset _world _island SCRIPT_DIR_FOR_DETECT
 
@@ -91,7 +94,6 @@ export PROFILE_TRAINER="train_dist_frozen.py"
 MODEL_ARGS="
     --model_size qwen-30b-a3b-e128k8 \
     --set_model_config_manually 0 \
-    --set_layernum_manually 1 \
     --vocab_size 151936 \
     --hidden_size 2048 \
     --num_attention_heads 32 \

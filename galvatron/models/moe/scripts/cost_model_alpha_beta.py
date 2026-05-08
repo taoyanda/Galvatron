@@ -76,7 +76,7 @@ def _ols_fit(xs: List[int], ys: List[float]) -> Tuple[float, float]:
 
 def main() -> None:
     s = SHAPE
-    cm = CostModel("mixtral-8x7b-e8k2")
+    cm = CostModel("qwen-30b-a3b-e128k8")
     dp = NUM_GPUS // (s["tp"] * s["ep"])
     micro_bsz = s["global_bsz"] // dp
 

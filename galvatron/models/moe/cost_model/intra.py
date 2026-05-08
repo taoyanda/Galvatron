@@ -74,10 +74,26 @@ class IntraCostModel(ICostModel):
         self.meta = self._load_json(
             os.path.join(self.meta_dir, f"{model_name}.json")
         )
+        # Path search order mirrors the compute-profile loader at
+        # ``_compute_profile_path``: try the seqlen-suffixed file first
+        # (the profiler's ``model_name(config, args)`` appends
+        # ``_seqlen{max_position_embeddings}`` whenever profile_mode !=
+        # "sequence", per ``meta_configs/config_utils.py:164``), then
+        # fall back to the legacy seqlen-less path so existing bundles
+        # built from older sweeps keep working.
+        _seqlen_for_path = int(self.meta.get("max_position_embeddings", 4096))
         self.memory_profile = self._load_json_first_existing([
             os.path.join(
                 self.configs_dir,
+                f"memory_profiling_{mixed_precision}_{model_name}_seqlen{_seqlen_for_path}.json",
+            ),
+            os.path.join(
+                self.configs_dir,
                 f"memory_profiling_{mixed_precision}_{model_name}.json",
+            ),
+            os.path.join(
+                self.configs_dir, "non-solver",
+                f"memory_profiling_{mixed_precision}_{model_name}_seqlen{_seqlen_for_path}.json",
             ),
             os.path.join(
                 self.configs_dir, "non-solver",
@@ -117,6 +133,18 @@ class IntraCostModel(ICostModel):
             os.path.join(
                 self.configs_dir,
                 f"fsep_overhead_profiling_{mixed_precision}_{model_name}.json",
+            )
+        )
+        # Per-microbatch overhead derived from chunks=1 vs chunks=2
+        # calibration pairs. Captures synchronous grad-reduce cost +
+        # extra PP send/recv + scheduler overhead — quantities the
+        # chunks=1-only Alpa formula can't see. ``None`` if no
+        # chunks-overhead JSON has been generated yet (analytical Alpa
+        # path is used as fallback).
+        self.chunks_overhead_profile: Optional[Dict[str, Any]] = self._try_load(
+            os.path.join(
+                self.configs_dir,
+                f"chunks_overhead_profiling_{mixed_precision}_{model_name}.json",
             )
         )
 
@@ -571,7 +599,7 @@ class IntraCostModel(ICostModel):
         # generalises to any pp on the same per-stage shape. Try the
         # exact key first (with no _pp suffix for back-compat), then
         # fall back to the global median.
-        key = f"tp{tp}_ep{ep}_bsz{micro_bsz}_seq{seq_len}"
+        key = f"tp{tp}_ep{ep}_micro_bsz{micro_bsz}_seq{seq_len}"
         entry = self.fsep_overhead_profile.get("by_shape", {}).get(key)
         if entry is not None:
             value = self._pick_overhead(
@@ -593,7 +621,7 @@ class IntraCostModel(ICostModel):
         """Per-MoE-layer FSEP memory overhead (expert replication, MB)."""
         if self.fsep_overhead_profile is None:
             return 0.0
-        key = f"tp{tp}_ep{ep}_bsz{micro_bsz}_seq{seq_len}"
+        key = f"tp{tp}_ep{ep}_micro_bsz{micro_bsz}_seq{seq_len}"
         entry = self.fsep_overhead_profile.get("by_shape", {}).get(key)
         if entry is not None:
             value = self._pick_overhead(
@@ -765,8 +793,14 @@ class IntraCostModel(ICostModel):
         # re-aggregating; the profile_cost_model_terms.py aggregator
         # writes the same string. ``bsz`` here is the per-rank micro
         # batch size used at calibration time.
+        # Shape key: (tp, ep, micro_bsz, seq_len, fsep). ``micro_bsz`` is
+        # the per-PP-stage compute batch size (= trainer's
+        # global_train_batch_size at chunks=1 calibration), NOT the
+        # per-rank value. DP and EP only enter as a feasibility guard
+        # (DP*EP ≤ micro_bsz, enforced upstream); they don't affect the
+        # lookup key.
         runtime_shape_key = (
-            f"tp{tp}_ep{ep}_bsz{per_rank_micro_bsz}_seq{seq_len}"
+            f"tp{tp}_ep{ep}_micro_bsz{micro_batch_size}_seq{seq_len}"
             f"_fsep{'on' if fsep else 'off'}"
         )
         runtime_entry = None
@@ -823,11 +857,61 @@ class IntraCostModel(ICostModel):
         else:
             stage_embedding_lmhead_ms = 0.0
 
-        # Direct attention slope (FSEP-invariant by construction);
-        # expert is the residual of per_layer_ms so split-and-recombine
-        # is identity under symmetric counts and the FSEP delta lands
-        # on the expert component under FSEP=on (uniform-FSEP rule).
-        expert_time_per_layer_ms = max(0.0, per_layer_ms - attention_time_per_layer_ms)
+        # Per-component fwd+bwd from the runtime profile when available.
+        # Step 8's per-unit calibration writes ``unit_breakdown`` under each
+        # shape with measured ``attention_fwd_bwd_ms`` (FSEP-invariant) and
+        # ``mlp_fwd_bwd_ms`` (FSEP-aware). When present we use those slopes
+        # directly: no analytical ``× (1 + bwd_mult)`` and no residual
+        # subtraction, so the per-attention/per-expert breakdown matches
+        # what was actually measured.
+        #
+        # DP modes are kept isolated in ``unit_breakdown["per_dp_mode"]``
+        # (zero3 vs zero2sdp differ measurably in fwd+bwd), so we pick the
+        # block matching the caller's ``(zero_stage, sdp)``. Fall back to
+        # whichever dp_mode was profiled if the requested one is missing.
+        unit_breakdown = (
+            runtime_entry.get("unit_breakdown")
+            if runtime_entry is not None else None
+        )
+        unit_block: Optional[Dict[str, Any]] = None
+        unit_dp_label: Optional[str] = None
+        if unit_breakdown is not None:
+            per_dp_blocks = unit_breakdown.get("per_dp_mode") or {}
+            requested_dp_mode = "zero3" if zero_stage == 3 else "zero2sdp"
+            unit_block = per_dp_blocks.get(requested_dp_mode)
+            if unit_block is not None:
+                unit_dp_label = requested_dp_mode
+            elif per_dp_blocks:
+                # Calibration didn't cover the requested mode at this shape
+                # — fall back to the other mode rather than the analytical
+                # path, since the per-component measurement is still closer
+                # to ground truth than ``× (1 + bwd_mult)``.
+                unit_dp_label, unit_block = next(iter(per_dp_blocks.items()))
+            if (unit_block is not None
+                    and (unit_block.get("attention_fwd_bwd_ms") is None
+                         or unit_block.get("mlp_fwd_bwd_ms") is None)):
+                unit_block = None
+
+        if unit_block is not None:
+            num_layers_unit = max(
+                1, int(unit_block.get("unit_num_layers", 1))
+            )
+            attention_time_per_layer_ms = (
+                float(unit_block["attention_fwd_bwd_ms"]) / num_layers_unit
+            )
+            expert_time_per_layer_ms = (
+                float(unit_block["mlp_fwd_bwd_ms"]) / num_layers_unit
+            )
+            time_source = (
+                f"runtime_profile[{runtime_shape_key}]"
+                f"+unit_breakdown[{unit_dp_label}]"
+            )
+        else:
+            # Direct attention slope (FSEP-invariant by construction);
+            # expert is the residual of per_layer_ms so split-and-recombine
+            # is identity under symmetric counts and the FSEP delta lands
+            # on the expert component under FSEP=on (uniform-FSEP rule).
+            expert_time_per_layer_ms = max(0.0, per_layer_ms - attention_time_per_layer_ms)
         # Symmetric identity: when n_attn == n_expert == num_layers, the
         # sum equals ``num_layers × per_layer_ms`` regardless of how we
         # divided the split between attention_time_per_layer_ms and
@@ -847,8 +931,11 @@ class IntraCostModel(ICostModel):
         fsep_overhead_ms = 0.0
         if (fsep and runtime_entry is None
                 and self.fsep_overhead_profile is not None):
+            # FSEP overhead profile is keyed by micro_bsz (= trainer's
+            # global_train_batch_size at chunks=1 calibration), matching
+            # the runtime_profile key convention.
             fsep_overhead_ms = self._fsep_overhead_per_expert_layer_ms(
-                tp, ep, per_rank_micro_bsz, seq_len
+                tp, ep, micro_batch_size, seq_len
             ) * num_expert_layers
         stage_compute_ms = (
             layers_compute_ms + stage_embedding_lmhead_ms + fsep_overhead_ms
@@ -1164,7 +1251,7 @@ class IntraCostModel(ICostModel):
             # n_expert (attention layers don't carry expert replicas).
             if fsep and self.fsep_overhead_profile is not None:
                 fsep_mem_overhead_mb = self._fsep_memory_overhead_per_expert_layer_mb(
-                    tp, ep, per_rank_micro_bsz, seq_len
+                    tp, ep, micro_batch_size, seq_len
                 ) * num_expert_layers
                 activations_mb_total += fsep_mem_overhead_mb
                 peak_mb += fsep_mem_overhead_mb

@@ -100,7 +100,7 @@ def _fmt(v: Optional[float], spec: str = "{:.0f}") -> str:
 
 
 def main() -> None:
-    cm = PPCostModel("mixtral-8x7b-e8k2")
+    cm = PPCostModel("qwen-30b-a3b-e128k8")
 
     print(
         "## PP cost-model validation: peak_iter_ms / peak_memory_mb vs real"

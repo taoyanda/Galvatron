@@ -1,19 +1,32 @@
-import torch
 import os
+from typing import Literal
+
 from flash_attn.ops.rms_norm import RMSNorm
 from megatron.core import mpu
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear, VocabParallelEmbedding
+from megatron.core.tensor_parallel import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
 from megatron.core.transformer.enums import AttnMaskType, AttnType
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+import torch
 from torch import nn
 
 from galvatron.core import get_args
 from galvatron.core.runtime.tensor_parallel import ParallelMLP
 from galvatron.core.runtime.tensor_parallel.mlp import MLPSubmodules
-from galvatron.core.runtime.tensor_parallel.attention import SelfAttention, SelfAttentionSubmodules
-from galvatron.core.runtime.tensor_parallel.attention_impl import DotProductAttention, FlashSelfOrCrossAttention, DistributedAttention
+from galvatron.core.runtime.tensor_parallel.attention import (
+    SelfAttention,
+    SelfAttentionSubmodules,
+)
+from galvatron.core.runtime.tensor_parallel.attention_impl import (
+    DotProductAttention,
+    FlashSelfOrCrossAttention,
+    DistributedAttention,
+)
 from galvatron.core.runtime.moe.mlp import GroupedMLP, SequentialMLP
 from galvatron.core.runtime.moe.router import TopKRouter
 from galvatron.core.runtime.moe.token_dispatcher import (
@@ -163,10 +176,28 @@ class MoERouter(nn.Module):
 
 # TODO: Add shared expert support
 class MoEMLP_tp(nn.Module):
-    def __init__(self, config, token_dispatcher, layer_number, tp_group=None, ep_group=None, tp_of_ep_group=None, tp_and_ep_group=None, test_mode=False):
+
+    def __init__(
+        self,
+        config,
+        token_dispatcher,
+        layer_number,
+        tp_group=None,
+        ep_group=None,
+        tp_of_ep_group=None,
+        tp_and_ep_group=None,
+        test_mode: Literal["prof_mlp", "prof_all", "training"] = "training",
+    ):
         super().__init__()
         self._test_mode = test_mode
-        if test_mode:
+        if self._test_mode == "prof_mlp":
+            # Build a single MoE MLP for profiling
+            # Results = computation profiling for SmartRouting solver input
+            megatron_config = core_transformer_config_from_args(get_args())
+            self.tp_group = tp_group.group if tp_group is not None else None
+            self.mlp = ParallelMLP(megatron_config, tp_group=self.tp_group)
+            return
+        elif self._test_mode == "prof_all":
             # Build the real per-rank MoE expert stack so that
             # --profile_unit mlp measures the same per-layer model state and
             # compute as the FSEP-off real path. The previous short-circuit
@@ -233,14 +264,91 @@ class MoEMLP_tp(nn.Module):
         # assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
 
         if self.use_fsep:
-            # TODO: Update solver to modify global_expert_indices
-            self.global_expert_indices = torch.tensor(range(self.num_global_experts),dtype=torch.int32,device=torch.cuda.current_device())
-            self.global_expert_indices = self.global_expert_indices.repeat(self.expert_parallel_size * self.expert_capacity_per_device // self.num_global_experts).reshape(self.expert_parallel_size, -1).contiguous()
-            self.global_expert_locations = torch.full((self.num_global_experts, self.expert_parallel_size * self.expert_capacity_per_device // self.num_global_experts), -1, dtype=torch.int32, device=torch.cuda.current_device())
+            # Under FSEP, the MoE block is FSDP-wrapped over the dp_of_ep
+            # group (parallel.py:159), whose size is world / (pp * tp_of_ep)
+            # — INDEPENDENT of ep_size. The custom all-to-all kernel
+            # (csrc/moe_all_to_all_kernels.cu:54-82) iterates
+            # [world_size, local_expert_num] = [dp_of_ep_size, cap] and
+            # reads global_placement linearly with rank * cap + slot, so
+            # `global_expert_indices` must be sized [dp_of_ep_size, cap].
+            #
+            # Per-rank row content: rank r's slots must hold the placement
+            # for whatever ep_rank rank r occupies in its ep_group. From
+            # gen_ep_group_dist (comm_groups.py:181-191):
+            #     within_dp_cell = (r % num_pp_groups) % (ep_size * tp_of_ep)
+            #     ep_rank(r)     = within_dp_cell // tp_of_ep
+            # Reduces to r % ep_size when tp_of_ep == 1 (striped) and to
+            # (r // tp_of_ep) % ep_size in the single-pp-stage case
+            # (consecutive within an ep cell). We compute the index
+            # explicitly and gather, so the placement is correct for
+            # arbitrary (ep, tp_of_ep, pp) combinations.
+            #
+            # `global_expert_locations` and `inverse_expert_map` keep
+            # their original ep-keyed shapes — they are consumed by the
+            # dispatcher's routing kernels (smart_routing_map_gpu and
+            # new_routing_map_with_gradients in fused_kernel.py), whose
+            # output buffer is sized for ep_size * num_local_experts and
+            # whose location semantics are ep-rank-relative, not world-
+            # rank-relative.
+            pp_size_for_fsep = mpu.get_pipeline_model_parallel_world_size()
+            tp_of_ep_size_for_fsep = mpu.get_expert_tensor_parallel_world_size(self.tp_of_ep_group)
+            world_size_for_fsep = torch.distributed.get_world_size()
+            self.dp_of_ep_size = world_size_for_fsep // (pp_size_for_fsep * tp_of_ep_size_for_fsep)
+            n_slots_ep = self.expert_parallel_size * self.expert_capacity_per_device
+            assert n_slots_ep % self.num_global_experts == 0, (
+                f"FSEP expects ep_size ({self.expert_parallel_size}) * "
+                f"expert_capacity_per_device ({self.expert_capacity_per_device}) "
+                f"= {n_slots_ep} to be divisible by num_global_experts "
+                f"({self.num_global_experts})"
+            )
+            replicas_ep = n_slots_ep // self.num_global_experts
+            cur_device = torch.cuda.current_device()
+            # Per-ep_rank initial placement: round-robin assignment of
+            # global experts into the per-ep_rank capacity slots. Shape
+            # [ep_size, cap] — same shape the LP solver returns later.
+            ep_placement_initial = (
+                torch.arange(self.num_global_experts, dtype=torch.int32, device=cur_device)
+                    .repeat(replicas_ep)
+                    .reshape(self.expert_parallel_size, -1)
+                    .contiguous()
+            )
+            # Per-(local FSDP rank) ep_row index, length dp_of_ep_size.
+            # The ep-group structure within each FSDP-EP group (one per
+            # pp stage) is self-similar, so we compute on local-rank
+            # 0..dp_of_ep_size-1 directly without a pp offset.
+            # ep_rank(local_rank) within an FSDP-EP group is `local % ep_size`
+            # — verified empirically against mpu.get_expert_model_parallel_rank
+            # for ep=2 tp_of_ep=2 (run_logs/step7_repro_ep2_tpoe2.log): the
+            # global formula `(r % (ep*tp_of_ep)) // tp_of_ep` matches mpu
+            # but is the GLOBAL ep_rank, not what the kernel needs. The
+            # kernel sees LOCAL ranks within the FSDP-EP group. The dp_of_ep
+            # group is built with stride tp_of_ep over global ranks
+            # (gen_dp_group_dist), and ep_groups are built with stride
+            # tp_of_ep within (pp, dp) cells — those two stridings cancel
+            # in the local index space, giving a striped ep_rank pattern
+            # `local % ep_size` regardless of tp_of_ep. For tp_of_ep=1 this
+            # is also the global formula, so behaviour is unchanged for
+            # ep ∈ {1, 2, 4}, tp_of_ep=1 (the configs in our current sweep).
+            local_ranks = torch.arange(self.dp_of_ep_size, dtype=torch.long, device=cur_device)
+            ep_row_index = local_ranks % self.expert_parallel_size
+            self.global_expert_indices = ep_placement_initial[ep_row_index].contiguous()
+            # global_expert_locations + inverse_expert_map: ep-keyed shapes
+            # to match what the LP solver returns and what the dispatcher
+            # routing kernels expect (ep_size * num_local_experts slots).
+            self.global_expert_locations = torch.full(
+                (self.num_global_experts, replicas_ep), -1,
+                dtype=torch.int32, device=cur_device,
+            )
             for i in range(self.num_global_experts):
-                self.global_expert_locations[i, :(self.expert_parallel_size * self.expert_capacity_per_device // self.num_global_experts)] = torch.arange(i, self.expert_parallel_size * self.expert_capacity_per_device, self.num_global_experts, dtype=torch.int32)
-            self.inverse_expert_map = torch.tensor(range(self.num_global_experts),dtype=torch.int32,device=torch.cuda.current_device())
-            self.inverse_expert_map = self.inverse_expert_map.reshape(-1,1).repeat(1, self.expert_parallel_size * self.expert_capacity_per_device // self.num_global_experts).contiguous()
+                self.global_expert_locations[i, :replicas_ep] = torch.arange(
+                    i, n_slots_ep, self.num_global_experts, dtype=torch.int32,
+                )
+            self.inverse_expert_map = torch.tensor(
+                range(self.num_global_experts), dtype=torch.int32, device=cur_device
+            )
+            self.inverse_expert_map = (
+                self.inverse_expert_map.reshape(-1, 1).repeat(1, replicas_ep).contiguous()
+            )
             # self.token_dispatcher = MoEAlltoAllTokenDispatcher(
             #     self.num_local_experts, self.local_expert_indices, config=self.config, ep_group=self.ep_group, tp_of_ep_group=self.tp_of_ep_group, tp_and_ep_group=self.tp_and_ep_group,
             #     layer_number = self.idx
@@ -254,7 +362,7 @@ class MoEMLP_tp(nn.Module):
         else:
             self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
             self.token_dispatcher = token_dispatcher
-        
+
         if args.moe_grouped_gemm:
             assert self.use_fsep is False, "Grouped gemm does not support fsep."
             self.experts = GroupedMLP(self.num_local_experts, self.config, self.tp_of_ep_group)
@@ -381,14 +489,91 @@ class MoELayer_tp(nn.Module):
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
         if self.use_fsep:
-            # TODO: Update solver to modify global_expert_indices
-            self.global_expert_indices = torch.tensor(range(self.num_global_experts),dtype=torch.int32,device=torch.cuda.current_device())
-            self.global_expert_indices = self.global_expert_indices.repeat(self.expert_parallel_size * self.expert_capacity_per_device // self.num_global_experts).reshape(self.expert_parallel_size, -1).contiguous()
-            self.global_expert_locations = torch.full((self.num_global_experts, self.expert_parallel_size * self.expert_capacity_per_device // self.num_global_experts), -1, dtype=torch.int32, device=torch.cuda.current_device())
+            # Under FSEP, the MoE block is FSDP-wrapped over the dp_of_ep
+            # group (parallel.py:159), whose size is world / (pp * tp_of_ep)
+            # — INDEPENDENT of ep_size. The custom all-to-all kernel
+            # (csrc/moe_all_to_all_kernels.cu:54-82) iterates
+            # [world_size, local_expert_num] = [dp_of_ep_size, cap] and
+            # reads global_placement linearly with rank * cap + slot, so
+            # `global_expert_indices` must be sized [dp_of_ep_size, cap].
+            #
+            # Per-rank row content: rank r's slots must hold the placement
+            # for whatever ep_rank rank r occupies in its ep_group. From
+            # gen_ep_group_dist (comm_groups.py:181-191):
+            #     within_dp_cell = (r % num_pp_groups) % (ep_size * tp_of_ep)
+            #     ep_rank(r)     = within_dp_cell // tp_of_ep
+            # Reduces to r % ep_size when tp_of_ep == 1 (striped) and to
+            # (r // tp_of_ep) % ep_size in the single-pp-stage case
+            # (consecutive within an ep cell). We compute the index
+            # explicitly and gather, so the placement is correct for
+            # arbitrary (ep, tp_of_ep, pp) combinations.
+            #
+            # `global_expert_locations` and `inverse_expert_map` keep
+            # their original ep-keyed shapes — they are consumed by the
+            # dispatcher's routing kernels (smart_routing_map_gpu and
+            # new_routing_map_with_gradients in fused_kernel.py), whose
+            # output buffer is sized for ep_size * num_local_experts and
+            # whose location semantics are ep-rank-relative, not world-
+            # rank-relative.
+            pp_size_for_fsep = mpu.get_pipeline_model_parallel_world_size()
+            tp_of_ep_size_for_fsep = mpu.get_expert_tensor_parallel_world_size(self.tp_of_ep_group)
+            world_size_for_fsep = torch.distributed.get_world_size()
+            self.dp_of_ep_size = world_size_for_fsep // (pp_size_for_fsep * tp_of_ep_size_for_fsep)
+            n_slots_ep = self.expert_parallel_size * self.expert_capacity_per_device
+            assert n_slots_ep % self.num_global_experts == 0, (
+                f"FSEP expects ep_size ({self.expert_parallel_size}) * "
+                f"expert_capacity_per_device ({self.expert_capacity_per_device}) "
+                f"= {n_slots_ep} to be divisible by num_global_experts "
+                f"({self.num_global_experts})"
+            )
+            replicas_ep = n_slots_ep // self.num_global_experts
+            cur_device = torch.cuda.current_device()
+            # Per-ep_rank initial placement: round-robin assignment of
+            # global experts into the per-ep_rank capacity slots. Shape
+            # [ep_size, cap] — same shape the LP solver returns later.
+            ep_placement_initial = (
+                torch.arange(self.num_global_experts, dtype=torch.int32, device=cur_device)
+                    .repeat(replicas_ep)
+                    .reshape(self.expert_parallel_size, -1)
+                    .contiguous()
+            )
+            # Per-(local FSDP rank) ep_row index, length dp_of_ep_size.
+            # The ep-group structure within each FSDP-EP group (one per
+            # pp stage) is self-similar, so we compute on local-rank
+            # 0..dp_of_ep_size-1 directly without a pp offset.
+            # ep_rank(local_rank) within an FSDP-EP group is `local % ep_size`
+            # — verified empirically against mpu.get_expert_model_parallel_rank
+            # for ep=2 tp_of_ep=2 (run_logs/step7_repro_ep2_tpoe2.log): the
+            # global formula `(r % (ep*tp_of_ep)) // tp_of_ep` matches mpu
+            # but is the GLOBAL ep_rank, not what the kernel needs. The
+            # kernel sees LOCAL ranks within the FSDP-EP group. The dp_of_ep
+            # group is built with stride tp_of_ep over global ranks
+            # (gen_dp_group_dist), and ep_groups are built with stride
+            # tp_of_ep within (pp, dp) cells — those two stridings cancel
+            # in the local index space, giving a striped ep_rank pattern
+            # `local % ep_size` regardless of tp_of_ep. For tp_of_ep=1 this
+            # is also the global formula, so behaviour is unchanged for
+            # ep ∈ {1, 2, 4}, tp_of_ep=1 (the configs in our current sweep).
+            local_ranks = torch.arange(self.dp_of_ep_size, dtype=torch.long, device=cur_device)
+            ep_row_index = local_ranks % self.expert_parallel_size
+            self.global_expert_indices = ep_placement_initial[ep_row_index].contiguous()
+            # global_expert_locations + inverse_expert_map: ep-keyed shapes
+            # to match what the LP solver returns and what the dispatcher
+            # routing kernels expect (ep_size * num_local_experts slots).
+            self.global_expert_locations = torch.full(
+                (self.num_global_experts, replicas_ep), -1,
+                dtype=torch.int32, device=cur_device,
+            )
             for i in range(self.num_global_experts):
-                self.global_expert_locations[i, :(self.expert_parallel_size * self.expert_capacity_per_device // self.num_global_experts)] = torch.arange(i, self.expert_parallel_size * self.expert_capacity_per_device, self.num_global_experts, dtype=torch.int32)
-            self.inverse_expert_map = torch.tensor(range(self.num_global_experts),dtype=torch.int32,device=torch.cuda.current_device())
-            self.inverse_expert_map = self.inverse_expert_map.reshape(-1,1).repeat(1, self.expert_parallel_size * self.expert_capacity_per_device // self.num_global_experts).contiguous()
+                self.global_expert_locations[i, :replicas_ep] = torch.arange(
+                    i, n_slots_ep, self.num_global_experts, dtype=torch.int32,
+                )
+            self.inverse_expert_map = torch.tensor(
+                range(self.num_global_experts), dtype=torch.int32, device=cur_device
+            )
+            self.inverse_expert_map = (
+                self.inverse_expert_map.reshape(-1, 1).repeat(1, replicas_ep).contiguous()
+            )
             # self.token_dispatcher = MoEAlltoAllTokenDispatcher(
             #     self.num_local_experts, self.local_expert_indices, config=self.config, ep_group=self.ep_group, tp_of_ep_group=self.tp_of_ep_group, tp_and_ep_group=self.tp_and_ep_group,
             #     layer_number = self.idx
@@ -494,6 +679,7 @@ class MoELayer_mlp(nn.Module):
         ep_group=None,
         tp_of_ep_group=None,
         tp_and_ep_group=None,
+        mode: Literal["prof_mlp", "prof_all"]= "prof_all",
     ):
         super().__init__()
         self.mlp = MoEMLP_tp(
@@ -504,7 +690,7 @@ class MoELayer_mlp(nn.Module):
             ep_group=ep_group,
             tp_of_ep_group=tp_of_ep_group,
             tp_and_ep_group=tp_and_ep_group,
-            test_mode=True,
+            test_mode=mode,
         )
         self.idx = layer_number
 
@@ -533,6 +719,7 @@ def construct_tensor_parallel_model(model, config, tp_groups_enc, sp_groups_enc,
             ]
         )
     elif args.profile_unit == "mlp":
+        prof_mode = args.mlp_profile_mode
         layers_tp = nn.ModuleList(
             [
                 MoELayer_mlp(config, i, 
@@ -540,7 +727,9 @@ def construct_tensor_parallel_model(model, config, tp_groups_enc, sp_groups_enc,
                     sp_group=sp_groups_enc[i + 1], 
                     ep_group=ep_groups_enc[i + 1], 
                     tp_of_ep_group=tp_of_ep_groups_enc[i + 1], 
-                    tp_and_ep_group=tp_and_ep_groups_enc[i + 1])
+                    tp_and_ep_group=tp_and_ep_groups_enc[i + 1],
+                    mode=prof_mode
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )

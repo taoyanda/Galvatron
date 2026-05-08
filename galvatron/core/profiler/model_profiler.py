@@ -332,6 +332,8 @@ class ModelProfiler(BaseProfiler):
         profile_dp_type = getattr(self.args, "profile_dp_type", "zero3")
         zero23 = profile_dp_type in ("zero2", "zero3")
 
+        use_fsep_local = bool(getattr(self.args, "use_fsep", False))
+
         def _bsz_compatible(pp_, tp_):
             parallel_product = pp_ * tp_ * ep_deg
             if parallel_product == 0 or world_size % parallel_product != 0:
@@ -343,6 +345,16 @@ class ModelProfiler(BaseProfiler):
             # dim and the dp=1 measurement is informative.
             if zero23 and dp_deg == 1 and pp_ == 1 and tp_ == 1 and ep_deg == 1:
                 return False
+            # Skip the (FSEP, dp_of_ep_size == 1) corner
+            # the FSDP-EP group degenerates to a single rank
+            # MoE backward does not survive
+            # FSEP-off+zero2 path works, different memory regime so we just skip the inner
+            # config here and leave the tp == world/pp datapoint to the
+            # FSEP-off memory profile
+            if use_fsep_local:
+                dp_of_ep_size = world_size // (pp_ * tp_)
+                if dp_of_ep_size <= 1:
+                    return False
             return dp_deg <= bsz and bsz % dp_deg == 0
 
         for seq in sequence_length_list:

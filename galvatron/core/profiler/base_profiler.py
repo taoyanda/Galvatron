@@ -15,19 +15,30 @@ class BaseProfiler:
 
     def _parallel_suffix(self, tp=None, ep=None):
         """Suffix to disambiguate profile output files across different TP/EP
-        sweeps. Keeps the legacy filename when both degrees are 1 so existing
-        non-FSEP workflows stay unchanged. Pass explicit tp/ep to compute the
-        suffix for a specific sweep point (used by the aggregator to iterate
-        over per-tp/ep files the inner launcher wrote).
+        sweeps and across the FSEP-on / FSEP-off regimes.
+
+        When ``use_fsep`` is set, append ``_fsep`` to the suffix to avoid 
+        overwriting.
+        The cost-model aggregator can read whichever it needs 
+        (``..._tp{X}_ep{Y}.json`` vs ``..._tp{X}_ep{Y}_fsep.json``), based on
+        the same ``args.use_fsep`` flag.
+
+        Keeps the legacy filename when both degrees are 1 AND FSEP is off
+        so existing non-FSEP workflows stay unchanged. Pass explicit tp/ep
+        to compute the suffix for a specific sweep point (used by the
+        aggregator to iterate over per-tp/ep files the inner launcher wrote).
         """
         if tp is None:
             tp = getattr(self.args, "global_tp_deg", 1) or 1
         if ep is None:
             ep = getattr(self.args, "global_ep_deg", 1) or 1
+        use_fsep = bool(getattr(self.args, "use_fsep", False))
         parts = []
         if tp > 1 or ep > 1:
             parts.append(f"tp{tp}")
             parts.append(f"ep{ep}")
+        if use_fsep:
+            parts.append("fsep")
         return ("_" + "_".join(parts)) if parts else ""
 
     def time_profiling_path_for(self, tp, ep):

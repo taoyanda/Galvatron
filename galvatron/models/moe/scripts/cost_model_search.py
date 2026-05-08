@@ -119,7 +119,6 @@ def estimate_one(
     num_attention_layers: Optional[int] = None,
     num_expert_layers: Optional[int] = None,
     num_stages_behind: int = 0,
-    micro_bsz: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Back-compat shim. Returns the legacy result-dict shape. New code
     should use :meth:`MoESearcher.score` directly, which returns a
@@ -133,7 +132,6 @@ def estimate_one(
         num_attention_layers=num_attention_layers,
         num_expert_layers=num_expert_layers,
         num_stages_behind=num_stages_behind,
-        micro_bsz=micro_bsz,
     )
     if result.error == "micro_bsz × dp != global_bsz":
         # Historical contract: the inner sweep returns ``None`` (rather
@@ -159,7 +157,6 @@ def search(
     num_attention_layers: Optional[int] = None,
     num_expert_layers: Optional[int] = None,
     num_stages_behind: int = 0,
-    micro_bsz: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Back-compat shim. Returns ``(viable, infeasible)`` lists of
     legacy-shape result dicts. New code should use
@@ -174,7 +171,6 @@ def search(
         num_attention_layers=num_attention_layers,
         num_expert_layers=num_expert_layers,
         num_stages_behind=num_stages_behind,
-        micro_bsz=micro_bsz,
     )
     return (
         [_result_to_dict(r) for r in ranked.viable],
@@ -242,20 +238,12 @@ def _run_asymmetry_sweep(
     best config's iter_ms / max_stage_ms / peak_memory_mb."""
     lo, hi = args.asymmetry_range
     n_attn = args.num_layers
-    effective_micro_bsz = (
-        args.micro_bsz if args.micro_bsz is not None else args.global_bsz
-    )
-    micro_label = (
-        ""
-        if effective_micro_bsz == args.global_bsz
-        else f"  micro_bsz={effective_micro_bsz}"
-    )
     print(
         f"# Asymmetric-layer sweep: {searcher.model_name}\n"
         f"#   num_gpus={args.num_gpus}  n_attn={n_attn} "
         f"n_expert ∈ [{n_attn + lo} .. {n_attn + hi}]  "
-        f"global_bsz={args.global_bsz}{micro_label}  "
-        f"seq_len={args.seq_len}  trust={args.trust_source}\n"
+        f"global_bsz={args.global_bsz}  seq_len={args.seq_len}  "
+        f"trust={args.trust_source}\n"
     )
     header = (
         f"{'n_attn':>6} {'n_exp':>6} | {'pp':>2} {'dp':>2} {'tp':>2} {'ep':>2} "
@@ -276,7 +264,6 @@ def _run_asymmetry_sweep(
             num_attention_layers=n_attn,
             num_expert_layers=n_exp,
             num_stages_behind=args.num_stages_behind,
-            micro_bsz=args.micro_bsz,
         )
         if not ranked.viable:
             print(f"{n_attn:>6} {n_exp:>6} | (no viable configs)")
@@ -324,22 +311,10 @@ def main() -> None:
              "and reports the best config for that expert-layer count.",
     )
     parser.add_argument("--global-bsz", type=int, default=4)
-    parser.add_argument(
-        "--micro-bsz", type=int, default=None,
-        help="Global microbatch size — total samples per "
-             "forward-backward step. Defaults to --global-bsz "
-             "(num_microbatches=1, single-step physics matching the "
-             "calibration sweep). Set < --global-bsz to model "
-             "multi-microbatch pipelines (num_microbatches="
-             "global_bsz/micro_bsz > 1), giving pp>1 configs a non-"
-             "degenerate (n_micro + pp − 1) × stage critical path. "
-             "Must divide --global-bsz; per-config configs where "
-             "dp × ep > micro_bsz go to infeasible.",
-    )
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument(
-        "--gpu-memory-mb", type=float, default=45000.0,
+        "--gpu-memory-mb", type=float, default=72657.0,
         help="OOM filter: drop configs with peak > this. Set to 0 to disable.",
     )
     parser.add_argument(
@@ -381,7 +356,6 @@ def main() -> None:
         num_attention_layers=args.num_attention_layers,
         num_expert_layers=args.num_expert_layers,
         num_stages_behind=args.num_stages_behind,
-        micro_bsz=args.micro_bsz,
     )
 
     n_attn = (args.num_attention_layers
@@ -397,20 +371,11 @@ def main() -> None:
         "" if args.num_stages_behind == 0
         else f"  num_stages_behind={args.num_stages_behind}"
     )
-    effective_micro_bsz = (
-        args.micro_bsz if args.micro_bsz is not None else args.global_bsz
-    )
-    micro_label = (
-        ""
-        if effective_micro_bsz == args.global_bsz
-        else f"  micro_bsz={effective_micro_bsz} "
-             f"(num_microbatches={args.global_bsz // effective_micro_bsz})"
-    )
 
     print(
         f"# Cost-model config search: {args.model}\n"
         f"#   num_gpus={args.num_gpus}  {layer_label}  "
-        f"global_bsz={args.global_bsz}{micro_label}  seq_len={args.seq_len}  "
+        f"global_bsz={args.global_bsz}  seq_len={args.seq_len}  "
         f"gpu_budget={'disabled' if budget is None else f'{budget:.0f} MB'}  "
         f"trust={args.trust_source}{reserve_label}\n"
         f"# {len(ranked.viable)} viable / {len(ranked.infeasible)} infeasible\n"
