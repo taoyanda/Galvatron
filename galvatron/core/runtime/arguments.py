@@ -58,6 +58,16 @@ def galvatron_training_args(parser, use_megatron=True):
         help="Profile granularity. Consumed by MoE model when running under the profiler.",
     )
     group.add_argument(
+        "--mlp_profile_mode",
+        choices=["prof_mlp", "prof_all"],
+        default="prof_all",
+        help="Selects MoE-MLP profiling variant when --profile_unit=mlp. "
+        "'prof_all' builds the real per-rank expert stack (matches FSEP-off "
+        "training; used for memory profiling). 'prof_mlp' builds a single "
+        "dense ParallelMLP per layer (per-token-per-MLP cost; feeds v_comp "
+        "in the greedy load balancer).",
+    )
+    group.add_argument(
         "--pp_deg",
         type=int,
         default=2,
