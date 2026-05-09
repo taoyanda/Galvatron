@@ -392,7 +392,8 @@ class MoESearcher:
         # Empirical regression: 10 configs failed at (PP=1, TP=2, EP=2,
         # gbsz=2) per_rank=1 + TP=2 with assertion "First dimension of the
         # tensor should be divisible by tensor parallel size". See task #47
-        # / cost_model_real_test_gap_fill.sh failures.
+        # / the merged gap-fill rows in cost_model_real_test.sh
+        # (originally surfaced by _legacy/cost_model_real_test_gap_fill.sh).
         per_rank_micro_bsz = micro_bsz // (cfg["dp"] * cfg["ep"])
         if cfg["ep"] > 1 and cfg["tp"] > 1 and per_rank_micro_bsz % cfg["tp"] != 0:
             return SearchResult(

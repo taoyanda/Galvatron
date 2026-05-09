@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .base import CostEstimate, ICostModel
-from .intra import IntraCostModel
+from .intra import IntraCostModel, IntraCostModelMeasuredAct
 
 
 class PPCostModel(ICostModel):
@@ -43,12 +43,28 @@ class PPCostModel(ICostModel):
     Wraps an :class:`IntraCostModel` (auto-constructed if not provided)
     and combines per-stage costs into a full-iteration estimate. For
     ``pp == 1`` this is just a passthrough to the wrapped model.
+
+    The ``use_measured_memory_profile`` flag selects between two
+    intra-stage variants when ``intra`` is auto-constructed:
+
+      * ``True`` (default, backward-compatible): instantiate
+        :class:`IntraCostModelMeasuredAct`, which sources per-layer
+        activation memory from ``profile_memory.sh``'s output (Step 4).
+      * ``False``: instantiate :class:`IntraCostModel` directly, which
+        will (after step 2b lands) source per-microbatch activation
+        from ``chunks_overhead_profile`` (Step 8b) and analytical
+        formulas — making Step 4 optional. Pre-2b, this is identical
+        to ``True``.
+
+    The flag is ignored if ``intra`` is provided directly (the caller
+    has already chosen the variant).
     """
 
     def __init__(
         self,
         model_name: Optional[str] = None,
         intra: Optional[IntraCostModel] = None,
+        use_measured_memory_profile: bool = True,
         **intra_kwargs: Any,
     ):
         if intra is None:
@@ -56,7 +72,11 @@ class PPCostModel(ICostModel):
                 raise ValueError(
                     "PPCostModel requires either ``intra`` or ``model_name``"
                 )
-            intra = IntraCostModel(model_name, **intra_kwargs)
+            intra_cls = (
+                IntraCostModelMeasuredAct if use_measured_memory_profile
+                else IntraCostModel
+            )
+            intra = intra_cls(model_name, **intra_kwargs)
         self.intra = intra
         # Re-expose loaded profiles for convenience (so callers can read
         # e.g. ``cm.runtime_profile`` without reaching through ``cm.intra``).

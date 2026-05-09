@@ -14,9 +14,17 @@
 # memory follows the routing imbalance. Stripping → biased
 # per-component memory readings under FSEP-on.
 #
-# So this script enforces FSEP=off. To profile FSEP-on configs, use
-# ``profile_memory_frozen.sh`` — that companion runs only the `all`
-# pass and sweeps over (EP, capacity) tuples.
+# So this script enforces FSEP=off. The legacy companion
+# ``_legacy/profile_memory_frozen.sh`` ran the FSEP-on `all` pass over
+# (EP, capacity) tuples and wrote ``memory_profiling_*_fsep.json`` and
+# ``memory_profiling_*_tp{T}_ep{E}_fsep.json`` files. It's no longer
+# part of the workflow because the cost model has zero code paths that
+# load ``_fsep``-suffixed memory JSONs (verified: every
+# ``memory_profile`` lookup in ``cost_model/intra.py`` uses non-fsep
+# filenames). FSEP-on memory predictions are sourced from
+# ``runtime_profile`` (full-iter cuda_peak_mb at every FSEP-on shape,
+# with α + β · N fitting) and ``fsep_overhead_profile`` (per-MoE-layer
+# memory delta from FSEP on/off pairs in the runtime sweep).
 set -euo pipefail
 
 export NUM_NODES=1
@@ -91,9 +99,11 @@ if printf '%s' "${MODEL_ARGS}" | grep -q -- "--use_fsep"; then
     echo "[profile_memory] ERROR: --use_fsep is set in MODEL_ARGS." >&2
     echo "  The three-pass loop strips layer types when constructing" >&2
     echo "  the model, which under FSEP biases the routing distribution" >&2
-    echo "  and therefore per-rank activation memory. Use" >&2
-    echo "  profile_memory_frozen.sh for FSEP-on profiling — it runs" >&2
-    echo "  only the 'all' pass." >&2
+    echo "  and therefore per-rank activation memory. FSEP-on memory" >&2
+    echo "  predictions are sourced from runtime_profile (Step 8) +" >&2
+    echo "  fsep_overhead_profile (Step 9). The legacy companion" >&2
+    echo "  _legacy/profile_memory_frozen.sh wrote _fsep-suffixed" >&2
+    echo "  memory JSONs that no consumer reads." >&2
     exit 1
 fi
 

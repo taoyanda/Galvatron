@@ -12,6 +12,11 @@ Public surface
   the right shape for external callers.
 - :class:`IntraCostModel` (``intra``): single-stage cost (``pp == 1``);
   consumes profile artifacts + runs the analytical fall-back.
+- :class:`IntraCostModelMeasuredAct` (``intra``): legacy variant that
+  sources per-layer activation memory from ``profile_memory.sh``'s
+  output (Step 4); selected by
+  ``PPCostModel(..., use_measured_memory_profile=True)`` (the current
+  default for backward compatibility).
 - :class:`PPCostModel` (``pp``): 1F1B-aware orchestrator over
   :class:`IntraCostModel`; the recommended public class for general use.
 
@@ -50,7 +55,7 @@ This name is preserved as an alias for :class:`PPCostModel`, which
 transparently delegates to :class:`IntraCostModel` when ``pp == 1``.
 """
 from .base import CostEstimate, CostQuery, ICostModel
-from .intra import IntraCostModel
+from .intra import IntraCostModel, IntraCostModelMeasuredAct
 from .pp import PPCostModel
 from .search import MoESearcher, RankedSearch, SearchResult, enumerate_configs
 
@@ -117,6 +122,7 @@ __all__ = [
     "CostQuery",
     "ICostModel",
     "IntraCostModel",
+    "IntraCostModelMeasuredAct",
     "PPCostModel",
     "CostModel",
     "estimate_cost",

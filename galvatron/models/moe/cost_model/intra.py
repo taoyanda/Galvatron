@@ -1292,3 +1292,27 @@ class IntraCostModel(ICostModel):
                 "has_lmhead": has_lmhead,
             },
         )
+
+
+class IntraCostModelMeasuredAct(IntraCostModel):
+    """Legacy variant that sources per-layer activation memory and
+    per-component activation splits from ``profile_memory.sh``'s output
+    (``memory_profiling_*.json`` and the per-(tp, ep) raw files).
+
+    This subclass exists for backward compatibility and for parity
+    comparisons during the IntraCostModel refactor that retires
+    ``profile_memory.sh`` (Step 4) from the standard workflow. The base
+    :class:`IntraCostModel` will (in step 2b) source per-microbatch
+    activation from ``chunks_overhead_profile`` (Step 8b per-component
+    slopes) and analytical formulas instead — making
+    ``profile_memory.sh`` optional. Until step 2b lands, this class is
+    a behavior-identical alias of the parent: the parent still loads
+    ``memory_profile`` and the four legacy methods
+    (``_memory_for_seq``, ``per_microbatch_activation_mb``,
+    ``per_layer_act_alpha_beta``, ``attention_mlp_act_ratio``) read
+    from it.
+
+    Selected by ``PPCostModel(..., use_measured_memory_profile=True)``,
+    which is the current default for backward compatibility.
+    """
+    pass

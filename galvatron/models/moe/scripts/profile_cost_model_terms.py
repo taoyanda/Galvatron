@@ -489,12 +489,26 @@ def _build_fsep_overhead_profile(by_shape_n: Dict) -> Dict:
 
 
 def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
-    """Build per-shape per-component time breakdown from non-"all" rows.
+    """Build per-shape per-component time + memory breakdown from non-"all" rows.
 
-    Returns ``{shape_key: {"per_dp_mode": {dp_mode: {component: ms, ...}}}}``.
-    The cost model uses these to skip the analytical ``bwd_mult × forward``
-    fall-back from step 6: end-to-end per-component fwd+bwd is now
-    measured directly.
+    Returns ``{shape_key: {"per_dp_mode": {dp_mode: {...}}, "dp_modes": [...]}}``.
+    Each ``per_dp_mode[dp_mode]`` block carries time fields (one canonical
+    N) and memory fields (α + β · N fit across all N values present):
+
+        # time — pinned to ``canonical_nl`` (see Multi-num_layers below)
+        attention_fwd_bwd_ms, attention_n_samples
+        mlp_fwd_bwd_ms,       mlp_n_samples
+        unit_num_layers
+
+        # memory — α + β · N fit on activation_peak_mb (chunks=1 anchor)
+        attention_act_alpha_beta: {alpha, beta, n_points}
+        mlp_act_alpha_beta:       {alpha, beta, n_points}
+
+    The cost model uses time fields to skip the analytical ``bwd_mult ×
+    forward`` fall-back from step 6: end-to-end per-component fwd+bwd is
+    measured directly. Memory fields replace the per-component activation
+    data the legacy ``profile_memory.sh`` (Step 4) emitted, sourced
+    instead from existing Step 8 ``_unit{attention,mlp}_nl{N}`` logs.
 
     DP modes are kept **isolated**, not averaged: zero3 and zero2sdp produce
     measurably different fwd+bwd times (zero3 re-shards parameters before
@@ -512,18 +526,97 @@ def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
       - mlp rows are fsep-aware: fsep=on and fsep=off live in the
         respective shape keys. Per-shape per-dp_mode on/off delta is the
         FSEP overhead.
-      - duplicate rows at the same (shape, dp_mode) average together
-        (re-runs / multiple ranks); cross-dp_mode samples never average.
+      - duplicate rows at the same (shape, dp_mode, num_layers) average
+        together (re-runs / multiple ranks); cross-dp_mode and cross-N
+        samples never average for time. Memory fits across N by design.
       - all rows are handled by the legacy aggregator and not seen here.
+
+    Multi-num_layers handling
+    -------------------------
+    Time and memory differ in how they handle multiple N values:
+
+      - Time: ``attention_fwd_bwd_ms / unit_num_layers`` (`intra.py:899-903`)
+        expects one canonical N. With ``NUM_LAYERS_LIST="2 4"`` we pin
+        the breakdown to a single N. Preference order: ``DEFAULT_NUM_LAYERS``
+        (4) if present, else the largest N (closer to asymptotic
+        per-layer slope). Without this pin, mixing N=2 and N=4 samples
+        silently averages cross-N measurements while ``unit_num_layers``
+        (set via ``setdefault``) takes whichever N was iterated first —
+        producing per-layer times off by up to 2×.
+
+      - Memory: ``activation_peak_mb`` is fit as α + β · N across ALL N
+        values present (typically nl ∈ {2, 4}). The new IntraCostModel
+        consumes (α, β) directly to compute per-layer-per-microbatch
+        activation at the query's stage layer count. With one N point,
+        β degenerates to 0 and α is the measured value (the consumer
+        must fall back to analytical β in that regime).
     """
     breakdown: Dict[str, Dict] = {}
 
-    # First pass: index attention measurements by
-    # (tp, ep, micro_bsz, pp, dp_mode). The fsep dimension is dropped —
-    # attention is FSEP-agnostic by design (the shell script skips
-    # ``unit=attention, fsep=on`` as redundant). DP mode IS kept.
-    attn_by_dp: Dict[Tuple, List[float]] = {}
+    # ====================================================================
+    # Memory pass — uses ALL N values (not pinned). Must run before the
+    # canonical-nl filter below, otherwise the fit collapses to one point.
+    # Indexes attention by (tp, ep, micro_bsz, pp, dp_mode) [fsep-agnostic],
+    # mlp by (shape_key, dp_mode) [fsep-aware]. For each cell we collect
+    # samples grouped by num_layers, average within each N, then fit.
+    # ====================================================================
+    mem_attn_by_n: Dict[Tuple, Dict[int, List[float]]] = {}
     for row in unit_rows:
+        if row.get("profile_unit") != "attention":
+            continue
+        if row.get("activation_peak_mb") is None:
+            continue
+        micro_bsz = _micro_bsz_at_calibration(
+            row["global_bsz"], row.get("chunks", 1)
+        )
+        key = (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"])
+        mem_attn_by_n.setdefault(key, {}).setdefault(
+            row["num_layers"], []
+        ).append(row["activation_peak_mb"])
+
+    mem_mlp_by_n: Dict[Tuple[str, str], Dict[int, List[float]]] = {}
+    mem_mlp_attn_keys: Dict[Tuple[str, str], Tuple] = {}
+    for row in unit_rows:
+        if row.get("profile_unit") != "mlp":
+            continue
+        if row.get("activation_peak_mb") is None:
+            continue
+        micro_bsz = _micro_bsz_at_calibration(
+            row["global_bsz"], row.get("chunks", 1)
+        )
+        shape_key = _shape_key(
+            row["tp"], row["ep"], micro_bsz, row["fsep"], row["pp"],
+        )
+        cell_key = (shape_key, row["dp_mode"])
+        mem_mlp_by_n.setdefault(cell_key, {}).setdefault(
+            row["num_layers"], []
+        ).append(row["activation_peak_mb"])
+        mem_mlp_attn_keys.setdefault(
+            cell_key,
+            (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"]),
+        )
+
+    # ====================================================================
+    # Time pass — pinned to canonical_nl. Original logic.
+    # ====================================================================
+    nls_present = {r["num_layers"] for r in unit_rows
+                   if r.get("num_layers") is not None}
+    if not nls_present:
+        # No usable rows at all — neither time nor memory data available.
+        return {}
+    canonical_nl = (
+        DEFAULT_NUM_LAYERS if DEFAULT_NUM_LAYERS in nls_present
+        else max(nls_present)
+    )
+    if len(nls_present) > 1:
+        print(
+            f"# unit_breakdown: multiple num_layers present {sorted(nls_present)}, "
+            f"pinning time to nl={canonical_nl}; memory uses α+β·N fit"
+        )
+    unit_rows_time = [r for r in unit_rows if r["num_layers"] == canonical_nl]
+
+    attn_by_dp: Dict[Tuple, List[float]] = {}
+    for row in unit_rows_time:
         if row.get("profile_unit") != "attention":
             continue
         if row.get("fwd_bwd_ms") is None:
@@ -534,11 +627,9 @@ def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
         key = (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"])
         attn_by_dp.setdefault(key, []).append(row["fwd_bwd_ms"])
 
-    # Second pass: collect mlp samples per (shape, dp_mode) and mate with
-    # the attention measurement from the SAME dp_mode.
     mlp_samples: Dict[Tuple[str, str], List[float]] = {}
     mlp_meta: Dict[Tuple[str, str], Dict] = {}
-    for row in unit_rows:
+    for row in unit_rows_time:
         if row.get("profile_unit") != "mlp":
             continue
         if row.get("fwd_bwd_ms") is None:
@@ -575,6 +666,41 @@ def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
             mlp_meta[(shape_key, dp_mode)]["unit_num_layers"]
         )
 
+    # ====================================================================
+    # Merge memory α+β fits into the per_dp_mode blocks. Creates new
+    # (shape, dp_mode) cells if needed (e.g., a memory-only row landed
+    # without a matching time sample; rare but the merge stays correct).
+    # ====================================================================
+    for (shape_key, dp_mode), by_n in mem_mlp_by_n.items():
+        ns = sorted(by_n.keys())
+        ys = [sum(by_n[n]) / len(by_n[n]) for n in ns]
+        if len(ns) >= 2:
+            alpha, beta = _ols_fit(ns, ys)
+        else:
+            alpha, beta = ys[0], 0.0
+        shape_block = breakdown.setdefault(
+            shape_key, {"per_dp_mode": {}}
+        )
+        per_dp = shape_block["per_dp_mode"].setdefault(dp_mode, {})
+        per_dp["mlp_act_alpha_beta"] = {
+            "alpha": alpha, "beta": beta, "n_points": len(ns),
+        }
+        attn_by_n = mem_attn_by_n.get(
+            mem_mlp_attn_keys[(shape_key, dp_mode)], {}
+        )
+        if attn_by_n:
+            attn_ns = sorted(attn_by_n.keys())
+            attn_ys = [
+                sum(attn_by_n[n]) / len(attn_by_n[n]) for n in attn_ns
+            ]
+            if len(attn_ns) >= 2:
+                a_alpha, a_beta = _ols_fit(attn_ns, attn_ys)
+            else:
+                a_alpha, a_beta = attn_ys[0], 0.0
+            per_dp["attention_act_alpha_beta"] = {
+                "alpha": a_alpha, "beta": a_beta, "n_points": len(attn_ns),
+            }
+
     # Convenience surface: list of dp_modes present per shape, sorted.
     for shape_block in breakdown.values():
         shape_block["dp_modes"] = sorted(shape_block["per_dp_mode"].keys())
@@ -585,8 +711,8 @@ def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
 def _build_chunks_overhead_profile(
     chunks1_rows: List[Dict], chunks_n_rows: List[Dict]
 ) -> Dict:
-    """Pair chunks=1 vs chunks>1 measurements per shape to derive the
-    per-microbatch overhead the cost model misses.
+    """Pair chunks=1 vs chunks>1 measurements per shape (and per component)
+    to derive the per-microbatch overhead the cost model misses.
 
     Calibration captures iter_ms and cuda_peak at chunks=1 (one microbatch
     per iteration), so the analytical Alpa formula
@@ -601,42 +727,85 @@ def _build_chunks_overhead_profile(
     with chunks (caching allocator churn), so a single offset per shape
     isn't enough — we need a slope.
 
-    Method: for each shape that has BOTH a chunks=1 and a chunks>1
-    measurement (same tp, ep, micro_bsz, pp, fsep, dp_mode, profile_unit),
-    compute:
-      time_per_extra_mb_ms       = Δ iter_ms / Δ num_microbatches
-      reserved_per_extra_mb_mb   = Δ cuda_peak_reserved_mb / Δ num_microbatches
-      allocated_per_extra_mb_mb  = Δ cuda_peak_mb / Δ num_microbatches
-    then store per shape (across whichever dp_modes were profiled). Cost
-    model adds these slopes × (num_microbatches − 1) on top of the
-    chunks=1-anchored prediction.
+    Per-component split. The chunks=2 vs chunks=1 cuda_peak delta at
+    ``profile_unit ∈ {attention, mlp}`` directly measures the
+    per-microbatch ACTIVATION memory of that component, separated from
+    grad-bucket / optimizer-state contributions (in 1F1B, activations
+    stack with chunks but grads accumulate in-place). The IntraCostModel
+    consumes these per-component slopes for its PP ``extra_reserve_mb``
+    calculation under asymmetric layer-split queries.
+
+    Output schema (per shape_key):
+      per_dp_mode[dp_mode] = {
+          # all-pass slopes (top-line, full model)
+          time_per_extra_microbatch_ms,
+          alloc_per_extra_microbatch_mb,
+          reserved_per_extra_microbatch_mb,
+          chunks_calibrated, iter_ms_at_chunks, num_layers,
+          # per-component activation-only slopes (1F1B reserve)
+          attention_alloc_per_extra_microbatch_mb,  # may be None
+          mlp_alloc_per_extra_microbatch_mb,        # may be None
+      }
+
+    Method: for each (shape, dp_mode, profile_unit) that has BOTH a
+    chunks=1 and a chunks>1 measurement (same tp, ep, micro_bsz, pp,
+    fsep, num_layers), compute Δ-per-microbatch slopes. The per-component
+    pairing for ``profile_unit=attention`` ignores the fsep dimension
+    (attention is fsep-agnostic — same skip-rule logic as
+    ``_build_unit_breakdown``), so an attention chunks=2 measurement at
+    fsep=on pairs with an fsep=on chunks=1 attention measurement, and
+    the resulting slope applies to both fsep on/off shape keys at the
+    consumer.
     """
-    def _index(rows: List[Dict]) -> Dict[Tuple, Dict]:
+    def _index(rows: List[Dict], unit: str) -> Dict[Tuple, Dict]:
+        """Index rows by pairing key. ``unit`` selects profile_unit.
+
+        Pairing key for ``unit=all``: full shape including fsep.
+        Pairing key for ``unit=attention``: fsep dropped (attention is
+            fsep-agnostic by the unit_breakdown skip-rule logic; we
+            broadcast the measurement to both fsep on/off shape keys).
+        Pairing key for ``unit=mlp``: full shape including fsep (MLP
+            FSEP overhead is shape-dependent).
+        """
         out: Dict[Tuple, Dict] = {}
         for row in rows:
-            if row.get("profile_unit", "all") != "all":
+            if row.get("profile_unit", "all") != unit:
                 continue
-            if row.get("iter_ms") is None:
+            # All-pass needs iter_ms; per-component only needs
+            # cuda_peak_mb (we use it for the activation slope only,
+            # not for time predictions).
+            if unit == "all" and row.get("iter_ms") is None:
+                continue
+            if unit != "all" and row.get("cuda_peak_mb") is None:
                 continue
             micro_bsz = _micro_bsz_at_calibration(
                 row["global_bsz"], row.get("chunks", 1)
             )
-            key = (row["tp"], row["ep"], micro_bsz, row["fsep"], row["pp"],
-                   row["dp_mode"])
+            # num_layers is part of the pairing key: chunks_overhead is
+            # layernum-invariant in expectation, but Δ across a
+            # different num_layers would conflate the chunks slope with
+            # a per-layer delta. Pair within the same num_layers.
+            if unit == "attention":
+                # fsep-agnostic: drop fsep from the key so the same
+                # measurement broadcasts to both fsep on/off shapes.
+                key = (row["tp"], row["ep"], micro_bsz, row["pp"],
+                       row["dp_mode"],
+                       row.get("num_layers", DEFAULT_NUM_LAYERS))
+            else:
+                key = (row["tp"], row["ep"], micro_bsz, row["fsep"],
+                       row["pp"], row["dp_mode"],
+                       row.get("num_layers", DEFAULT_NUM_LAYERS))
             out[key] = row
         return out
 
-    chunks1_by_key = _index(chunks1_rows)
-    chunks_n_by_key = _index(chunks_n_rows)
-
+    # All-pass pairing (top-line slopes — original behavior).
+    chunks1_all = _index(chunks1_rows, "all")
+    chunks_n_all = _index(chunks_n_rows, "all")
     by_shape: Dict[str, Dict] = {}
-    for key, row_n in chunks_n_by_key.items():
-        row_1 = chunks1_by_key.get(key)
+    for key, row_n in chunks_n_all.items():
+        row_1 = chunks1_all.get(key)
         if row_1 is None:
             continue
-        # num_microbatches at calibration time = chunks (each chunk is
-        # one microbatch under chunks=1 / chunks=N profiling at this
-        # script's defaults).
         d_num_mb = row_n["chunks"] - row_1["chunks"]
         if d_num_mb <= 0:
             continue
@@ -651,16 +820,79 @@ def _build_chunks_overhead_profile(
                 and row_1.get("cuda_peak_reserved_mb") is not None):
             d_reserved_mb = (row_n["cuda_peak_reserved_mb"]
                              - row_1["cuda_peak_reserved_mb"])
-        tp_v, ep_v, micro_bsz, fsep, pp_v, dp_mode = key
+        tp_v, ep_v, micro_bsz, fsep, pp_v, dp_mode, _nl = key
         shape_key = _shape_key(tp_v, ep_v, micro_bsz, fsep, pp_v)
         block = by_shape.setdefault(shape_key, {"per_dp_mode": {}})
+        existing = block["per_dp_mode"].get(dp_mode)
+        if existing is not None and existing.get("num_layers", 0) >= _nl:
+            continue
         block["per_dp_mode"][dp_mode] = {
             "time_per_extra_microbatch_ms": time_slope,
             "alloc_per_extra_microbatch_mb": d_alloc_mb,
             "reserved_per_extra_microbatch_mb": d_reserved_mb,
             "chunks_calibrated": [row_1["chunks"], row_n["chunks"]],
             "iter_ms_at_chunks": [row_1["iter_ms"], row_n["iter_ms"]],
+            "num_layers": _nl,
+            # Per-component slopes — populated in the next pass when
+            # the matching attention/mlp chunks=1↔chunks=2 pairs exist.
+            "attention_alloc_per_extra_microbatch_mb": None,
+            "mlp_alloc_per_extra_microbatch_mb": None,
         }
+
+    # Per-component pairing — attention (fsep-agnostic) and mlp
+    # (fsep-aware). Slopes feed the IntraCostModel's per-component PP
+    # extra_reserve_mb calculation.
+    chunks1_attn = _index(chunks1_rows, "attention")
+    chunks_n_attn = _index(chunks_n_rows, "attention")
+    chunks1_mlp = _index(chunks1_rows, "mlp")
+    chunks_n_mlp = _index(chunks_n_rows, "mlp")
+
+    def _component_alloc_slope(by_key_n: Dict[Tuple, Dict],
+                                by_key_1: Dict[Tuple, Dict],
+                                key: Tuple) -> Optional[float]:
+        row_n = by_key_n.get(key)
+        row_1 = by_key_1.get(key)
+        if row_n is None or row_1 is None:
+            return None
+        d_num_mb = row_n["chunks"] - row_1["chunks"]
+        if d_num_mb <= 0:
+            return None
+        if (row_n.get("cuda_peak_mb") is None
+                or row_1.get("cuda_peak_mb") is None):
+            return None
+        return (row_n["cuda_peak_mb"] - row_1["cuda_peak_mb"]) / d_num_mb
+
+    # Walk every (shape, dp_mode) we already have an all-pass entry for
+    # and back-fill the per-component slopes when matching pairs exist.
+    for shape_key, block in by_shape.items():
+        # Decode the shape_key back to its components for component
+        # pairing-key construction. Schema: tp{T}_ep{E}_micro_bsz{M}_seq{S}
+        # _fsep{ON|OFF}[_pp{P}].
+        m = re.match(
+            r"tp(\d+)_ep(\d+)_micro_bsz(\d+)_seq(\d+)_fsep(on|off)(?:_pp(\d+))?$",
+            shape_key,
+        )
+        if m is None:
+            continue
+        tp_v = int(m.group(1))
+        ep_v = int(m.group(2))
+        micro_bsz = int(m.group(3))
+        fsep = m.group(5)
+        pp_v = int(m.group(6)) if m.group(6) else DEFAULT_PP
+        for dp_mode, dp_block in block["per_dp_mode"].items():
+            nl = dp_block["num_layers"]
+            attn_key = (tp_v, ep_v, micro_bsz, pp_v, dp_mode, nl)
+            mlp_key = (tp_v, ep_v, micro_bsz, fsep, pp_v, dp_mode, nl)
+            attn_slope = _component_alloc_slope(
+                chunks_n_attn, chunks1_attn, attn_key
+            )
+            mlp_slope = _component_alloc_slope(
+                chunks_n_mlp, chunks1_mlp, mlp_key
+            )
+            if attn_slope is not None:
+                dp_block["attention_alloc_per_extra_microbatch_mb"] = attn_slope
+            if mlp_slope is not None:
+                dp_block["mlp_alloc_per_extra_microbatch_mb"] = mlp_slope
 
     # Convenience: median time/memory slope across shapes (used by cost
     # model as a fallback when a query lands on a shape we didn't pair).

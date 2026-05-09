@@ -68,7 +68,14 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS=${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export ENABLE_SOLVER=${ENABLE_SOLVER:-1}
 
-NUM_LAYERS=${NUM_LAYERS:-4}
+# NUM_LAYERS_LIST: space-separated layernums profiled per shape. Default
+# "2 4" gives the aggregator two N points to fit `iter_ms = α + β · N`
+# per-shape (and same for params/optimizer/activation/peak), which the
+# cost model uses to extrapolate to production num_layers (48 on Qwen3-
+# A3B). Set NUM_LAYERS_LIST="4" to revert to the legacy single-point
+# sweep. Single-value NUM_LAYERS env var is honored as a back-compat
+# alias when NUM_LAYERS_LIST is unset.
+NUM_LAYERS_LIST=${NUM_LAYERS_LIST:-${NUM_LAYERS:-"2 4"}}
 SEQ_LEN=4096
 EPOCHS=20  # need ≥20 iters: profiler averages [10, 20), and we sample the
             # memory-evolution snapshot at iter 10.
@@ -102,8 +109,10 @@ NUM_GLOBAL_EXPERTS=128
 #     zero2sdp.
 # A sister script can override the base matrix by setting
 # ``CONFIGS_BASE_OVERRIDE`` to a newline-separated string of 6-tuples
-# before sourcing this file — used by ``cost_model_real_test_gap_fill.sh``
-# to add gbsz=1/2 calibration entries without re-running the main matrix.
+# before sourcing this file — used by ``cost_model_real_test_chunks2.sh``
+# (chunks=2 sweep) and historically by the legacy
+# ``_legacy/cost_model_real_test_gap_fill.sh``, whose gbsz=1/2 entries
+# are now folded into ``DEFAULT_CONFIGS_BASE`` directly.
 if [ -n "${CONFIGS_BASE_OVERRIDE:-}" ]; then
     # ``mapfile -t`` reads one line per array element, stripping the
     # trailing newline. Tuples must already be space-separated internally
@@ -125,7 +134,19 @@ DEFAULT_CONFIGS_BASE=(
     # gbsz to keep the per-microbatch shape identical to the chunks=1
     # anchor).
     #
-    # === PP=1 FSEP-on (dp_of_ep > 1) ===
+    # The matrix covers gbsz ∈ {4, 2, 1} to match the search's
+    # micro_bsz ∈ {1, 2, 4} enumeration. gbsz=4 is the primary
+    # calibration anchor; gbsz=2 entries fill the (tp, ep) feasible
+    # subset at micro_bsz=2 (DP × EP ≤ 2 per per-rank ≥ 1 sample);
+    # gbsz=1 entries cover the FSEP-off-only feasible shapes at
+    # micro_bsz=1 (FSEP-on is infeasible — see gbsz=1 block below).
+    #
+    # FSEP-on / FSEP-off split: this iteration ships FSEP-on for
+    # gbsz ∈ {4, 2} (per directive). gbsz=1 has no FSEP-on feasible
+    # shapes at all (pp×tp must equal world=4 for per-rank ≥ 1, but
+    # FSEP-on requires pp×tp < world), so the gbsz=1 rows are FSEP-off.
+    #
+    # === gbsz=4 PP=1 FSEP-on (dp_of_ep > 1) ===
     "1 1 1 zero2sdp 4 on"
     "1 1 2 zero2sdp 4 on"
     "1 1 4 zero2sdp 4 on"
@@ -133,23 +154,51 @@ DEFAULT_CONFIGS_BASE=(
     "1 2 2 zero2sdp 4 on"
     # (1 4 1 ...) FSEP-on excluded — dp_of_ep_size=1 (degenerate)
     #
-    # === PP=1 FSEP-off (full (tp, ep) matrix) ===
-    "1 1 1 zero2sdp 4 off"
-    "1 1 2 zero2sdp 4 off"
-    "1 1 4 zero2sdp 4 off"
-    "1 2 1 zero2sdp 4 off"
-    "1 2 2 zero2sdp 4 off"
-    "1 4 1 zero2sdp 4 off"
+    # === gbsz=4 PP=1 FSEP-off (full (tp, ep) matrix) ===
+    # "1 1 1 zero2sdp 4 off"
+    # "1 1 2 zero2sdp 4 off"
+    # "1 1 4 zero2sdp 4 off"
+    # "1 2 1 zero2sdp 4 off"
+    # "1 2 2 zero2sdp 4 off"
+    # "1 4 1 zero2sdp 4 off"
     #
-    # === PP=2 FSEP-on (per-stage world=2; dp_of_ep > 1 → tp=1) ===
+    # === gbsz=4 PP=2 FSEP-on (per-stage world=2; dp_of_ep > 1 → tp=1) ===
     "2 1 1 zero2sdp 4 on"
     "2 1 2 zero2sdp 4 on"
     # (2 2 1 ...) FSEP-on excluded — dp_of_ep = 4/(2*2) = 1 (degenerate)
     #
-    # === PP=2 FSEP-off (full (tp, ep) matrix that fits per-stage=2) ===
-    "2 1 1 zero2sdp 4 off"
-    "2 1 2 zero2sdp 4 off"
-    "2 2 1 zero2sdp 4 off"
+    # === gbsz=4 PP=2 FSEP-off (full (tp, ep) matrix that fits per-stage=2) ===
+    # "2 1 1 zero2sdp 4 off"
+    # "2 1 2 zero2sdp 4 off"
+    # "2 2 1 zero2sdp 4 off"
+    #
+    # === gbsz=2 (micro_bsz=2; feasibility: DP*EP ≤ 2) ===
+    # "1 2 1 zero2sdp 2 off"
+    # "1 2 2 zero2sdp 2 off"
+    # (1 2 2 ... 2 on) excluded: TP>1 AND EP>1 with per_rank=1
+    # trips relocate_activations' batch-dim TP shard
+    # (1 % TP=2 != 0). MoESearcher.score() rejects the same
+    # shape upfront, so calibration here would be unused.
+    "1 2 1 zero2sdp 2 on"
+    # "1 4 1 zero2sdp 2 off"
+    # "2 1 1 zero2sdp 2 off"
+    # "2 1 2 zero2sdp 2 off"
+    "2 1 2 zero2sdp 2 on"
+    "2 1 1 zero2sdp 2 on"
+    # "2 2 1 zero2sdp 2 off"
+    #
+    # === gbsz=1 (micro_bsz=1; feasibility: DP=1, EP=1; PP*TP=4) ===
+    # FSEP-on infeasible at micro_bsz=1: pp*tp must equal world=4 for
+    # per-rank ≥ 1, but FSEP-on requires pp*tp < world. So gbsz=1 is
+    # the one place the otherwise FSEP-on-only matrix ships FSEP-off
+    # rows — without them, search queries at micro_bsz=1 hit the
+    # analytical fallback (search.py enumerates micro_bsz ∈ {1, 2, 4}).
+    # The aggregator's unit_breakdown indexes attention fsep-agnostically,
+    # so the attention measurements from these rows still inform any
+    # FSEP-on shape predictions at micro_bsz=1 if such predictions are
+    # ever derived analytically.
+    "1 4 1 zero2sdp 1 off"
+    "2 2 1 zero2sdp 1 off"
 )
 fi
 
@@ -159,15 +208,15 @@ fi
 # per-block compute profile and removes the `bwd_mult` coefficient from
 # downstream predictions — the backward time is measured directly.
 #
-# Skip rules:
-#   - (profile_unit=attention, fsep=on): redundant. The attention-only model
-#     instantiates ``MoELayer_attention`` which has no MoE/router/dispatcher,
-#     so FSEP-on and FSEP-off are byte-identical for attention. We collapse
-#     to fsep=off only.
-#   - (profile_unit=mlp): kept for both fsep ∈ {on, off} — this is where the
-#     FSEP overhead lives, and we want shape-dependent on/off deltas.
-#   - (profile_unit=all): kept for both fsep ∈ {on, off} — top-line numbers
-#     used by the cost model's primary lookup.
+# All three units (all, attention, mlp) run for every (fsep ∈ {on, off})
+# tuple. Historically (under a mixed FSEP-on/off matrix) we skipped
+# ``attention+fsep=on`` as byte-identical to ``attention+fsep=off`` — but
+# under the FSEP-on-only matrix that skip orphans attention entirely (no
+# fsep=off entries to fall back to). The attention-only model has no
+# MoE/router/dispatcher, so the FSEP flag is a no-op for that pass; the
+# aggregator's ``unit_breakdown`` indexes attention by
+# (tp, ep, micro_bsz, pp, dp_mode) (fsep-agnostic), so duplicate samples
+# at fsep=on / fsep=off are averaged transparently.
 #
 # Set DEFAULT_PROFILE_UNITS to override (e.g. "all" for legacy single-pass).
 DEFAULT_PROFILE_UNITS=${DEFAULT_PROFILE_UNITS:-"all attention mlp"}
@@ -176,10 +225,6 @@ DEFAULT_CONFIGS=()
 for tuple in "${DEFAULT_CONFIGS_BASE[@]}"; do
     read -r _pp _tp _ep _dp _bsz _fsep <<< "${tuple}"
     for unit in ${DEFAULT_PROFILE_UNITS}; do
-        # FSEP-on attention is redundant with fsep-off attention (no MoE).
-        if [ "${unit}" = "attention" ] && [ "${_fsep}" = "on" ]; then
-            continue
-        fi
         DEFAULT_CONFIGS+=("${_pp} ${_tp} ${_ep} ${_dp} ${_bsz} ${_fsep} ${unit}")
     done
 done
@@ -223,6 +268,11 @@ echo "[env] ENABLE_SOLVER=${ENABLE_SOLVER}"
 
 cd "${MODEL_DIR}"
 
+echo "[matrix] NUM_LAYERS_LIST=${NUM_LAYERS_LIST}"
+for NUM_LAYERS in ${NUM_LAYERS_LIST}; do
+echo "========================================================"
+echo "  cost_model_real: starting layernum sweep nl=${NUM_LAYERS}"
+echo "========================================================"
 for tuple in "${CONFIGS[@]}"; do
     # The matrix tuple's "bsz" column is now the per-stage micro_bsz
     # (= trainer's gbsz at chunks=1). At CHUNKS>1 we double gbsz to keep
@@ -231,13 +281,6 @@ for tuple in "${CONFIGS[@]}"; do
     FSEP_MODE=${FSEP_MODE:-on}
     PROFILE_UNIT=${PROFILE_UNIT:-all}
     GLOBAL_BSZ=$(( MICRO_BSZ * CHUNKS ))
-    # FSEP-on attention is byte-identical to FSEP-off attention (the
-    # attention-only model class has no MoE). Skip the redundant row even
-    # when an explicit 7-tuple specifies it.
-    if [ "${PROFILE_UNIT}" = "attention" ] && [ "${FSEP_MODE}" = "on" ]; then
-        echo "[skip] profile_unit=attention fsep=on is redundant with fsep=off"
-        continue
-    fi
     CAP=$((NUM_GLOBAL_EXPERTS / EP))  # 128 / EP for Qwen3-30B-A3B
     if [ "${DP_MODE}" = "zero2sdp" ]; then
         DP_TYPE_FLAG="zero2"
@@ -386,4 +429,5 @@ for tuple in "${CONFIGS[@]}"; do
     # inherits an empty path — preserving the bypass.
     rm -rf "${PER_RUN_MPS_DIR}" 2>/dev/null || true
 done
+done  # NUM_LAYERS loop
 echo "all configs done; logs in ${LOG_DIR}"

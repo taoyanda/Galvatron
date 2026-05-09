@@ -22,11 +22,15 @@
 # would be biased and would not match what the full block sees in
 # real training.
 #
-# So this script enforces FSEP=off. To profile FSEP-on configs, use
-# ``profile_computation_frozen.sh`` — that companion runs only the
-# `all` pass and sweeps over (EP, capacity) tuples. The cost model's
-# FSEP-on path uses the FSEP-off per-component ratio (via the
-# attention-invariance rule) to avoid relying on biased FSEP-on
+# So this script enforces FSEP=off. The legacy companion
+# ``_legacy/profile_computation_frozen.sh`` ran the FSEP-on `all` pass
+# over (EP, capacity) tuples; it's no longer part of the workflow because
+# the runtime calibration sweep (cost_model_real_test.sh) now captures
+# FSEP-on full-iter measurements at every (tp, ep, micro_bsz, fsep=on,
+# pp) shape, and `fsep_overhead_profile` is built from the FSEP-on/off
+# pairs in runtime_profiling — not from FSEP-on compute fwd-only data.
+# The cost model's FSEP-on path uses the FSEP-off per-component ratio
+# (via the attention-invariance rule) to avoid relying on biased FSEP-on
 # per-component data.
 set -euo pipefail
 
@@ -47,8 +51,8 @@ export CUDA_HOME='/usr/local/cuda-12.1'
 
 # Disable LAER online re-planning during the FSEP-off baseline so
 # per-layer time stays stationary (linear-fit assumption). The
-# FSEP-on companion script (profile_computation_frozen.sh) flips this
-# to 1 so the solver runs and converges before the freeze.
+# legacy FSEP-on companion (_legacy/profile_computation_frozen.sh)
+# flipped this to 1 so the solver ran and converged before the freeze.
 export ENABLE_SOLVER=${ENABLE_SOLVER:-0}
 
 LAUNCHER="torchrun"
@@ -119,7 +123,8 @@ fi
 # (layertype_0_bsz<B>_seq<S>{,_attention,_mlp}). The cost model reads the
 # split slopes when present and falls back to the full-block slope when
 # only the `all` pass has run.
-for UNIT in all attention mlp; do
+# for UNIT in all attention mlp; do
+for UNIT in mlp; do
     echo "[profile_computation] pass: profile_unit=${UNIT}"
     python3 profiler.py ${MODEL_ARGS} ${PROFILE_ARGS} --profile_unit ${UNIT}
 done
