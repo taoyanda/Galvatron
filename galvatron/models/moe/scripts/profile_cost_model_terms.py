@@ -67,12 +67,14 @@ NUM_MOE_LAYERS = 4
 _LOG_NAME_RE = re.compile(
     r"cost_model_real_tp(\d+)_ep(\d+)_(zero2sdp|zero3)_bsz(\d+)_fsep(on|off)"
     r"(?:_nl(\d+))?(?:_pp(\d+))?(?:_chunks(\d+))?"
-    r"(?:_unit(all|attention|mlp))?\.log$"
+    r"(?:_unit(all|attention|mlp))?(?:_w(\d+))?\.log$"
 )
 DEFAULT_NUM_LAYERS = 4  # filenames without `_nl<N>` were taken at N=4
 DEFAULT_PP = 1          # filenames without `_pp<P>` were taken at PP=1
 DEFAULT_CHUNKS = 1      # filenames without `_chunks<C>` were taken at chunks=1
 DEFAULT_PROFILE_UNIT = "all"  # filenames without `_unit<X>` are full-iter "all"
+DEFAULT_WORLD = 4       # filenames without `_w<W>` were taken on the
+                        # default 4-GPU sweep target (NUM_GPUS_PER_NODE=4)
 
 # Per-rank instrumentation lines emitted by train_dist_random.py.
 _PARAMS_RE = re.compile(r"\[real_measure\] params_mb=([\d.]+)")
@@ -132,8 +134,15 @@ def parse_log(path: str) -> Dict[str, Optional[float]]:
             if iter_match:
                 iter_samples.append(float(iter_match.group(1)))
     if iter_samples:
-        # Profiler emits seconds; cost model speaks ms.
-        parsed["iter_ms"] = (sum(iter_samples) / len(iter_samples)) * 1000.0
+        # Profiler emits seconds; cost model speaks ms. Take MAX across
+        # ranks: under PP > 1 the slowest stage's wall-clock is the
+        # actual iter time. Stage-0 ranks finish their forward earlier
+        # than the bottleneck stage and their host-side time.time() loop
+        # progresses faster than the GPU is actually doing work — so
+        # mean-across-ranks systematically under-counts iter time.
+        # Empirically max(rank.iter_ms) ≈ fwd_bwd_ms + opt_ms (the
+        # GPU-synchronized number).
+        parsed["iter_ms"] = max(iter_samples) * 1000.0
     return parsed
 
 
@@ -152,20 +161,28 @@ def _micro_bsz_at_calibration(global_bsz: int, chunks: int = 1) -> int:
 
 
 def _shape_key(tp: int, ep: int, micro_bsz: int, fsep: str,
-               pp: int = DEFAULT_PP) -> str:
-    """Per-(shape, pp) key.
+               pp: int = DEFAULT_PP, world: int = DEFAULT_WORLD) -> str:
+    """Per-(shape, pp, world) key.
 
-    Encodes ``(tp, ep, micro_bsz, fsep[, pp])`` — the axes the cost model
-    actually queries. ``micro_bsz`` here is the per-stage compute batch
-    size (= trainer's global_train_batch_size at chunks=1 calibration).
-    DP and EP only enter as feasibility guards (per-rank ≥ 1 sample),
-    not as shape-key dimensions.
+    Encodes ``(tp, ep, micro_bsz, fsep[, pp][, world])`` — the axes the
+    cost model actually queries. ``micro_bsz`` here is the per-stage
+    compute batch size (= trainer's global_train_batch_size at chunks=1
+    calibration). DP and EP only enter as feasibility guards (per-rank
+    ≥ 1 sample), not as shape-key dimensions.
 
-    For ``pp == 1`` the suffix is omitted (PP=1 is the cost-model
-    default). ``pp > 1`` adds an explicit ``_pp{P}`` suffix.
+    For ``pp == 1`` and ``world == 4`` (the cost-model defaults) the
+    respective suffixes are omitted. ``pp > 1`` adds ``_pp{P}``;
+    ``world ≠ 4`` adds ``_w{W}``. The cost model uses the ``_w{W}``
+    namespace when predicting PP>1 stage compute via the matching
+    shrunk-world calibration (a PP=k stage on world=W has the same
+    per-rank compute as a PP=1 run on world = W/k).
     """
     base = f"tp{tp}_ep{ep}_micro_bsz{micro_bsz}_seq{SEQ_LEN}_fsep{fsep}"
-    return base if pp == DEFAULT_PP else f"{base}_pp{pp}"
+    if pp != DEFAULT_PP:
+        base += f"_pp{pp}"
+    if world != DEFAULT_WORLD:
+        base += f"_w{world}"
+    return base
 
 
 def _ols_fit(xs: List[int], ys: List[float]) -> Tuple[float, float]:
@@ -210,6 +227,9 @@ def _enumerate_logs() -> List[Dict]:
         # group(9) is the optional ``_unit{X}`` suffix introduced when step 6
         # was merged into step 8. Legacy logs have no suffix → "all".
         profile_unit = (name_match.group(9) or DEFAULT_PROFILE_UNIT)
+        # group(10) is the optional ``_w{W}`` suffix added when world ≠ 4.
+        # Logs without it were taken on the default 4-GPU sweep target.
+        world = int(name_match.group(10)) if name_match.group(10) else DEFAULT_WORLD
         path = os.path.join(LOG_DIR, filename)
         parsed = parse_log(path)
         # ``opt_ms`` and ``optimizer_mb`` are only emitted by the full-iter
@@ -228,6 +248,7 @@ def _enumerate_logs() -> List[Dict]:
             "num_layers": num_layers, "pp": pp,
             "chunks": chunks,
             "profile_unit": profile_unit,
+            "world": world,
             **parsed,
         })
     return rows
@@ -287,7 +308,8 @@ def _build_runtime_profile(rows: List[Dict]) -> Dict:
             row["global_bsz"], row.get("chunks", 1)
         )
         shape_key = _shape_key(row["tp"], row["ep"], micro_bsz,
-                               row["fsep"], row["pp"])
+                               row["fsep"], row["pp"],
+                               row.get("world", DEFAULT_WORLD))
         index_key = (shape_key, row["num_layers"])
         prior = by_shape_n.get(index_key)
         if prior is None:
@@ -296,6 +318,7 @@ def _build_runtime_profile(rows: List[Dict]) -> Dict:
                 "global_bsz": row["global_bsz"], "micro_bsz": micro_bsz,
                 "fsep": row["fsep"], "seq": SEQ_LEN,
                 "pp": row["pp"], "num_layers": row["num_layers"],
+                "world": row.get("world", DEFAULT_WORLD),
                 "fwd_bwd_ms": row["fwd_bwd_ms"],
                 "opt_ms": row["opt_ms"],
                 "iter_ms": row.get("iter_ms"),
@@ -343,9 +366,22 @@ def _build_runtime_profile(rows: List[Dict]) -> Dict:
         if len(samples) >= 2:
             xs = [int(s["num_layers"]) for s in samples]
             fits: Dict[str, Dict[str, float]] = {}
-            # ``iter_ms`` is the full-iteration time including PP bubble
-            # + comm — critical for validating PPCostModel under bubble
-            # overhead.
+            # Memory fields use OLS α + β · N — embed/lm-head/framework
+            # buckets contribute a real per-iter offset (α) that's
+            # approximately N-invariant, so the linear fit captures both
+            # asymptotic per-layer slope AND constant offset correctly.
+            #
+            # Time fields use a SLOPE-ONLY fit (β = Δy / ΔN, α = 0
+            # implicit). Rationale: under PP > 1 the calibration N range
+            # ({2, 4} = 1-2 layers/stage) is in the GPU-under-saturated
+            # regime — per-layer cost is HIGHER than the asymptotic value
+            # because kernels don't fill the GPU. The α from a 2-point
+            # OLS fit captures that under-saturation, NOT real per-iter
+            # overhead, and over-extrapolates at unseen N. Slope-only
+            # ``β · query_N`` projects with the slope BETWEEN calibration
+            # points, which is closer to the saturated-regime per-layer
+            # cost. Empirically reduces nl=8 PP=2 fwd_bwd extrapolation
+            # error from +21 % to +8 %.
             for field_name in ("params_mb", "optimizer_mb",
                                "activation_peak_mb", "cuda_peak_mb",
                                "fwd_bwd_ms", "opt_ms", "iter_ms"):
@@ -354,6 +390,16 @@ def _build_runtime_profile(rows: List[Dict]) -> Dict:
                     for s in samples if s.get(field_name) is not None
                 ]
                 if len(ys) == len(xs) and len(ys) >= 2:
+                    # α + β·N via OLS for all fields, time and memory alike.
+                    # Earlier code forced α=0 for time fields under a
+                    # pre-matching-world rationale (the same-world PP=2
+                    # calibration was over-predicting at small N, and
+                    # zeroing α masked it). Under matching-world PP=1
+                    # calibration, α captures real per-iter overhead
+                    # (embedding fwd+bwd + lm-head fwd+bwd + dataloader)
+                    # that the cost model needs to keep — discarding it
+                    # systematically under-predicts iter_ms by α/iter at
+                    # production num_layers.
                     alpha, beta = _ols_fit(xs, ys)
                     fits[field_name] = {
                         "alpha": alpha, "beta": beta, "n_points": len(ys),
@@ -376,13 +422,17 @@ def _build_fsep_overhead_profile(by_shape_n: Dict) -> Dict:
     is the same idea on ``cuda_peak_mb``. Used by IntraCostModel's
     analytical fall-back so FSEP-on configs without a calibrated
     runtime entry get a non-zero penalty."""
-    pairs: Dict[Tuple[int, int, int, int, int], Dict[str, Dict]] = {}
+    pairs: Dict[Tuple[int, int, int, int, int, int], Dict[str, Dict]] = {}
     for (_shape_key, _num_layers), entry in by_shape_n.items():
-        # Index by the underlying (tp, ep, micro_bsz, pp, num_layers)
-        # rather than re-parsing the shape key.
+        # Index by the underlying (tp, ep, micro_bsz, pp, num_layers, world)
+        # rather than re-parsing the shape key. Including world prevents
+        # cross-world FSEP-on/off pair-up (a 4-GPU FSEP-on shape and a
+        # 2-GPU FSEP-off shape with the same (tp, ep, mbsz) are NOT a
+        # valid overhead pair).
         index_key = (
             entry["tp"], entry["ep"], entry["micro_bsz"],
             entry["pp"], entry["num_layers"],
+            entry.get("world", DEFAULT_WORLD),
         )
         pairs.setdefault(index_key, {})[entry["fsep"]] = entry
 
@@ -586,6 +636,7 @@ def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
         )
         shape_key = _shape_key(
             row["tp"], row["ep"], micro_bsz, row["fsep"], row["pp"],
+            row.get("world", DEFAULT_WORLD),
         )
         cell_key = (shape_key, row["dp_mode"])
         mem_mlp_by_n.setdefault(cell_key, {}).setdefault(
@@ -593,7 +644,8 @@ def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
         ).append(row["activation_peak_mb"])
         mem_mlp_attn_keys.setdefault(
             cell_key,
-            (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"]),
+            (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"],
+             row.get("world", DEFAULT_WORLD)),
         )
 
     # ====================================================================
@@ -624,7 +676,8 @@ def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
         micro_bsz = _micro_bsz_at_calibration(
             row["global_bsz"], row.get("chunks", 1)
         )
-        key = (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"])
+        key = (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"],
+               row.get("world", DEFAULT_WORLD))
         attn_by_dp.setdefault(key, []).append(row["fwd_bwd_ms"])
 
     mlp_samples: Dict[Tuple[str, str], List[float]] = {}
@@ -639,13 +692,15 @@ def _build_unit_breakdown(unit_rows: List[Dict]) -> Dict:
         )
         shape_key = _shape_key(
             row["tp"], row["ep"], micro_bsz, row["fsep"], row["pp"],
+            row.get("world", DEFAULT_WORLD),
         )
         cell_key = (shape_key, row["dp_mode"])
         mlp_samples.setdefault(cell_key, []).append(row["fwd_bwd_ms"])
         meta = mlp_meta.setdefault(cell_key, {})
         meta.setdefault(
             "attn_key",
-            (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"]),
+            (row["tp"], row["ep"], micro_bsz, row["pp"], row["dp_mode"],
+             row.get("world", DEFAULT_WORLD)),
         )
         meta.setdefault("unit_num_layers", row["num_layers"])
 
@@ -790,11 +845,13 @@ def _build_chunks_overhead_profile(
                 # measurement broadcasts to both fsep on/off shapes.
                 key = (row["tp"], row["ep"], micro_bsz, row["pp"],
                        row["dp_mode"],
-                       row.get("num_layers", DEFAULT_NUM_LAYERS))
+                       row.get("num_layers", DEFAULT_NUM_LAYERS),
+                       row.get("world", DEFAULT_WORLD))
             else:
                 key = (row["tp"], row["ep"], micro_bsz, row["fsep"],
                        row["pp"], row["dp_mode"],
-                       row.get("num_layers", DEFAULT_NUM_LAYERS))
+                       row.get("num_layers", DEFAULT_NUM_LAYERS),
+                       row.get("world", DEFAULT_WORLD))
             out[key] = row
         return out
 
@@ -820,8 +877,8 @@ def _build_chunks_overhead_profile(
                 and row_1.get("cuda_peak_reserved_mb") is not None):
             d_reserved_mb = (row_n["cuda_peak_reserved_mb"]
                              - row_1["cuda_peak_reserved_mb"])
-        tp_v, ep_v, micro_bsz, fsep, pp_v, dp_mode, _nl = key
-        shape_key = _shape_key(tp_v, ep_v, micro_bsz, fsep, pp_v)
+        tp_v, ep_v, micro_bsz, fsep, pp_v, dp_mode, _nl, world_v = key
+        shape_key = _shape_key(tp_v, ep_v, micro_bsz, fsep, pp_v, world_v)
         block = by_shape.setdefault(shape_key, {"per_dp_mode": {}})
         existing = block["per_dp_mode"].get(dp_mode)
         if existing is not None and existing.get("num_layers", 0) >= _nl:
@@ -867,9 +924,10 @@ def _build_chunks_overhead_profile(
     for shape_key, block in by_shape.items():
         # Decode the shape_key back to its components for component
         # pairing-key construction. Schema: tp{T}_ep{E}_micro_bsz{M}_seq{S}
-        # _fsep{ON|OFF}[_pp{P}].
+        # _fsep{ON|OFF}[_pp{P}][_w{W}].
         m = re.match(
-            r"tp(\d+)_ep(\d+)_micro_bsz(\d+)_seq(\d+)_fsep(on|off)(?:_pp(\d+))?$",
+            r"tp(\d+)_ep(\d+)_micro_bsz(\d+)_seq(\d+)_fsep(on|off)"
+            r"(?:_pp(\d+))?(?:_w(\d+))?$",
             shape_key,
         )
         if m is None:
@@ -879,10 +937,12 @@ def _build_chunks_overhead_profile(
         micro_bsz = int(m.group(3))
         fsep = m.group(5)
         pp_v = int(m.group(6)) if m.group(6) else DEFAULT_PP
+        world_v = int(m.group(7)) if m.group(7) else DEFAULT_WORLD
         for dp_mode, dp_block in block["per_dp_mode"].items():
             nl = dp_block["num_layers"]
-            attn_key = (tp_v, ep_v, micro_bsz, pp_v, dp_mode, nl)
-            mlp_key = (tp_v, ep_v, micro_bsz, fsep, pp_v, dp_mode, nl)
+            attn_key = (tp_v, ep_v, micro_bsz, pp_v, dp_mode, nl, world_v)
+            mlp_key = (tp_v, ep_v, micro_bsz, fsep, pp_v, dp_mode, nl,
+                       world_v)
             attn_slope = _component_alloc_slope(
                 chunks_n_attn, chunks1_attn, attn_key
             )

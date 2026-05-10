@@ -456,13 +456,15 @@ def train(args):
                 _fb_samples.append(_fb_s.elapsed_time(_fb_e))
                 _opt_samples.append(_op_s.elapsed_time(_op_e))
 
-            # After the first full iteration, capture activation peak and
-            # the actual optimizer-state byte count (Adam allocates m/v on
-            # first step). When running --profile_forward 1, .step() is a
-            # no-op, so optimizer.state stays empty and we report 0; the
-            # analytical optimizer_mb_pred from above is the value to compare
-            # against in that mode.
-            if not _rm_act_logged and rank == 0:
+            # Steady-state memory snapshot. Fires at iter == _MEM_ITER, AFTER
+            # the reset_peak_memory_stats() / fwd / bwd / opt sequence above —
+            # so ``max_memory_allocated()`` reflects the peak of one
+            # post-warmup steady-state iter, not the process-startup peak
+            # (which includes one-off FSDP all-gather / dataloader / kernel
+            # JIT allocations and produces a non-monotonic
+            # ``activation_peak_mb`` vs num_layers when the cost-model fitter
+            # ingests it).
+            if iter == _MEM_ITER and not _rm_act_logged and rank == 0:
                 _peak_mb = torch.cuda.max_memory_allocated() / 1e6
                 # Reserved peak — what nvidia-smi sees at the device
                 # level (modulo CUDA context overhead). Typically larger
@@ -478,6 +480,13 @@ def train(args):
                     )
                     / 1e6
                 )
+                # ``activation_peak_mb`` is a derived diagnostic
+                # (cuda_peak − params − opt). Under FSDP+SDP the peak
+                # doesn't always coincide with full params+opt residency
+                # (params are gathered/discarded on demand), so this
+                # subtraction can under-count. Cost-model fits should
+                # prefer ``cuda_peak_mb`` directly; ``activation_peak_mb``
+                # remains for back-compat reporting.
                 _act_peak_mb = max(0.0, _peak_mb - _rm_params_mb - _opt_actual_mb)
                 print(
                     f"[real_measure] optimizer_mb={_opt_actual_mb:.2f} "

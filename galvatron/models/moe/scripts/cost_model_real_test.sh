@@ -24,8 +24,12 @@
 #   bash galvatron/models/moe/scripts/cost_model_real_test.sh pp tp ep dp bsz fsep  # one config
 set -euo pipefail
 
-export NUM_NODES=1
-export NUM_GPUS_PER_NODE=4
+export NUM_NODES=${NUM_NODES:-1}
+# 4-GPU is the default sweep target. Override to 2 (or other) to profile
+# the matching shape that PP>1 stage compute would see — e.g. NUM_GPUS_PER_NODE=2
+# bash ... 1 1 2 zero2sdp 4 on all  produces the PP=1 calibration that maps
+# onto a PP=2 stage on the 4-GPU box.
+export NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE:-4}
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-29500}
 export NODE_RANK=${RANK:-0}
@@ -123,6 +127,16 @@ else
 DEFAULT_CONFIGS_BASE=(
     # "pp tp ep dp_mode micro_bsz fsep"  (dp_mode = zero2sdp, fsep ∈ {on, off})
     #
+    # === Multi-world PP=1 calibration regime ===
+    # PP>1 stage compute is now predicted by looking up the matching
+    # PP=1 calibration at world = num_gpus / pp (see cost_model/pp.py).
+    # That means the main sweep is PP=1 only; PP=2 calibration entries
+    # have moved to the opt-in ``cost_model_real_test_pp2.sh`` sister.
+    # Sister scripts ``cost_model_real_test_w2.sh`` and
+    # ``cost_model_real_test_w1.sh`` produce the world=2 / world=1
+    # calibration data that the PP=2 / PP=4 stage-compute predictions
+    # consume.
+    #
     # zero3 was dropped from the default matrix per project decision —
     # empirically it was uniformly slower than zero2sdp (4-15% on
     # full-iter, more on MLP-only) at identical memory peaks, with no
@@ -135,70 +149,57 @@ DEFAULT_CONFIGS_BASE=(
     # anchor).
     #
     # The matrix covers gbsz ∈ {4, 2, 1} to match the search's
-    # micro_bsz ∈ {1, 2, 4} enumeration. gbsz=4 is the primary
-    # calibration anchor; gbsz=2 entries fill the (tp, ep) feasible
-    # subset at micro_bsz=2 (DP × EP ≤ 2 per per-rank ≥ 1 sample);
-    # gbsz=1 entries cover the FSEP-off-only feasible shapes at
-    # micro_bsz=1 (FSEP-on is infeasible — see gbsz=1 block below).
+    # micro_bsz ∈ {1, 2, 4} enumeration. FSEP-on is shipped where
+    # feasible (`pp×tp < world`); the gbsz=1 row uses FSEP-off because
+    # the only PP=1 mbsz=1 layout in this matrix has `tp = world`.
     #
-    # FSEP-on / FSEP-off split: this iteration ships FSEP-on for
-    # gbsz ∈ {4, 2} (per directive). gbsz=1 has no FSEP-on feasible
-    # shapes at all (pp×tp must equal world=4 for per-rank ≥ 1, but
-    # FSEP-on requires pp×tp < world), so the gbsz=1 rows are FSEP-off.
+    # Feasibility rules (PP=1, world=4):
+    #   1. dp × tp ≤ world AND tp × ep ≤ world (FSDP+TP and TP×EP
+    #      grids each fit independently; dp and ep can overlap on the
+    #      same ranks via tp_consec layout, so the strict
+    #      dp×tp×ep == world requirement does NOT hold). The
+    #      ``cost_model_real_test_w{2,1}.sh`` sister sweeps use the
+    #      same rule with the appropriate world.
+    #   2. per_rank = mbsz / dp ≥ 1
+    #   3. The trainer (arguments.py) asserts
+    #      ``global_bsz % max_dp_deg == 0`` where
+    #      ``max_dp_deg = world / (pp × min(tp×ep, vocab_tp))``
+    #      and the sweep sets ``vocab_tp = tp``. With pp=1 and
+    #      ``min(tp×ep, tp) == tp`` (since ep≥1), this collapses to
+    #      ``max_dp_deg = world/tp``, hence
+    #        tp=1 ⇒ gbsz must be divisible by 4 → only gbsz=4 feasible
+    #        tp=2 ⇒ divisible by 2 → gbsz ∈ {2, 4}
+    #        tp=4 ⇒ divisible by 1 → gbsz ∈ {1, 2, 4}
+    #      So **all tp=1 entries are confined to gbsz=4 at world=4**.
+    #   4. relocate_activations' batch-dim TP shard requires
+    #      per_rank ≥ tp **only when both TP>1 AND EP>1** (MoESearcher
+    #      .score rejects the same shape upfront). At world=4, the
+    #      empirically-failing case is (1,2,2) at gbsz=2 (per-rank=2,
+    #      TP=2, EP=2 — assertion still trips even though batch_dim
+    #      should split cleanly), so it's excluded.
+    #   5. FSEP-on requires tp × pp < world AND dp_of_ep_size =
+    #      world/(pp×tp) > 1 — otherwise the FSDP-EP group degenerates
+    #      and the FSEP all-to-all returns NULL on backward. We ship
+    #      FSEP-off for tp = world shapes; the search's matching PP>1
+    #      stage prediction maps onto world=2 / world=1 sister sweeps
+    #      which pick up FSEP-on coverage.
     #
-    # === gbsz=4 PP=1 FSEP-on (dp_of_ep > 1) ===
+    # === gbsz=4 PP=1 FSEP-on (5 shapes) ===
     "1 1 1 zero2sdp 4 on"
     "1 1 2 zero2sdp 4 on"
     "1 1 4 zero2sdp 4 on"
     "1 2 1 zero2sdp 4 on"
     "1 2 2 zero2sdp 4 on"
-    # (1 4 1 ...) FSEP-on excluded — dp_of_ep_size=1 (degenerate)
+    # === gbsz=4 PP=1 FSEP-off (1 shape — tp=world) ===
+    "1 4 1 zero2sdp 4 off"
     #
-    # === gbsz=4 PP=1 FSEP-off (full (tp, ep) matrix) ===
-    # "1 1 1 zero2sdp 4 off"
-    # "1 1 2 zero2sdp 4 off"
-    # "1 1 4 zero2sdp 4 off"
-    # "1 2 1 zero2sdp 4 off"
-    # "1 2 2 zero2sdp 4 off"
-    # "1 4 1 zero2sdp 4 off"
-    #
-    # === gbsz=4 PP=2 FSEP-on (per-stage world=2; dp_of_ep > 1 → tp=1) ===
-    "2 1 1 zero2sdp 4 on"
-    "2 1 2 zero2sdp 4 on"
-    # (2 2 1 ...) FSEP-on excluded — dp_of_ep = 4/(2*2) = 1 (degenerate)
-    #
-    # === gbsz=4 PP=2 FSEP-off (full (tp, ep) matrix that fits per-stage=2) ===
-    # "2 1 1 zero2sdp 4 off"
-    # "2 1 2 zero2sdp 4 off"
-    # "2 2 1 zero2sdp 4 off"
-    #
-    # === gbsz=2 (micro_bsz=2; feasibility: DP*EP ≤ 2) ===
-    # "1 2 1 zero2sdp 2 off"
-    # "1 2 2 zero2sdp 2 off"
-    # (1 2 2 ... 2 on) excluded: TP>1 AND EP>1 with per_rank=1
-    # trips relocate_activations' batch-dim TP shard
-    # (1 % TP=2 != 0). MoESearcher.score() rejects the same
-    # shape upfront, so calibration here would be unused.
+    # === gbsz=2 PP=1 (tp=1 entries infeasible per trainer; (1,2,2)
+    #     excluded empirically — relocate_activations 1st-dim assertion) ===
     "1 2 1 zero2sdp 2 on"
-    # "1 4 1 zero2sdp 2 off"
-    # "2 1 1 zero2sdp 2 off"
-    # "2 1 2 zero2sdp 2 off"
-    "2 1 2 zero2sdp 2 on"
-    "2 1 1 zero2sdp 2 on"
-    # "2 2 1 zero2sdp 2 off"
+    "1 4 1 zero2sdp 2 off"
     #
-    # === gbsz=1 (micro_bsz=1; feasibility: DP=1, EP=1; PP*TP=4) ===
-    # FSEP-on infeasible at micro_bsz=1: pp*tp must equal world=4 for
-    # per-rank ≥ 1, but FSEP-on requires pp*tp < world. So gbsz=1 is
-    # the one place the otherwise FSEP-on-only matrix ships FSEP-off
-    # rows — without them, search queries at micro_bsz=1 hit the
-    # analytical fallback (search.py enumerates micro_bsz ∈ {1, 2, 4}).
-    # The aggregator's unit_breakdown indexes attention fsep-agnostically,
-    # so the attention measurements from these rows still inform any
-    # FSEP-on shape predictions at micro_bsz=1 if such predictions are
-    # ever derived analytically.
+    # === gbsz=1 PP=1 (only tp=4 feasible per trainer) ===
     "1 4 1 zero2sdp 1 off"
-    "2 2 1 zero2sdp 1 off"
 )
 fi
 
@@ -218,8 +219,14 @@ fi
 # (tp, ep, micro_bsz, pp, dp_mode) (fsep-agnostic), so duplicate samples
 # at fsep=on / fsep=off are averaged transparently.
 #
-# Set DEFAULT_PROFILE_UNITS to override (e.g. "all" for legacy single-pass).
-DEFAULT_PROFILE_UNITS=${DEFAULT_PROFILE_UNITS:-"all attention mlp"}
+# Default ships ``all`` only; the per-component (attention, mlp) split
+# is opt-in for the asymmetric-search path, where the cost model needs
+# per-layer attention vs MLP cost separately. Symmetric search and the
+# multi-world PP=1 calibration only consume aggregated iter_ms /
+# fwd_bwd_ms, so the per-component runs are otherwise wasted. To enable
+# the asymmetric matrix:
+#   DEFAULT_PROFILE_UNITS="all attention mlp" bash cost_model_real_test.sh
+DEFAULT_PROFILE_UNITS=${DEFAULT_PROFILE_UNITS:-"all"}
 
 DEFAULT_CONFIGS=()
 for tuple in "${DEFAULT_CONFIGS_BASE[@]}"; do
@@ -353,6 +360,18 @@ for tuple in "${CONFIGS[@]}"; do
     if [ "${PROFILE_UNIT}" != "all" ]; then
         LOG_PATH="${LOG_PATH}_unit${PROFILE_UNIT}"
     fi
+    # World-size tag: when calibrating on a non-default world (e.g., 2 GPUs
+    # to profile the matching shape that a PP=2 stage on a 4-GPU box would
+    # see), the (tp, ep, mbsz, fsep) tuple no longer disambiguates the run
+    # — the same shape on world=4 vs world=2 has different (dp, sdp) deg.
+    # Tag with ``_w{world}`` so 2-GPU logs land beside (not overwriting)
+    # the 4-GPU baselines. Default sweep target world=4 keeps the legacy
+    # filename for back-compat with already-ingested calibration data.
+    _world=$(( NUM_NODES * NUM_GPUS_PER_NODE ))
+    if [ "${_world}" != "4" ]; then
+        LOG_PATH="${LOG_PATH}_w${_world}"
+    fi
+    unset _world
     LOG_PATH="${LOG_PATH}.log"
 
     # Per-config throw-away MPS pipe dir to ensure no MPS control-socket

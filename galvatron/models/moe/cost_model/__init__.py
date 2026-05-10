@@ -11,12 +11,17 @@ Public surface
   (``iter_ms``, ``max_stage_ms``, ``peak_memory_mb``) plus provenance —
   the right shape for external callers.
 - :class:`IntraCostModel` (``intra``): single-stage cost (``pp == 1``);
-  consumes profile artifacts + runs the analytical fall-back.
+  consumes profile artifacts + runs the analytical fall-back. The
+  default cost-model intra-stage class — sources per-component
+  activation slope from ``chunks_overhead_profile`` (Step 8b) when
+  available, with closed-form boundary-tensor fallback. Does not
+  require ``profile_memory.sh`` (Step 4) data.
 - :class:`IntraCostModelMeasuredAct` (``intra``): legacy variant that
   sources per-layer activation memory from ``profile_memory.sh``'s
   output (Step 4); selected by
-  ``PPCostModel(..., use_measured_memory_profile=True)`` (the current
-  default for backward compatibility).
+  ``PPCostModel(..., use_measured_memory_profile=True)``. Use for
+  parity comparisons against pre-refactor data or when working with
+  environments that still have Step 4 data on disk.
 - :class:`PPCostModel` (``pp``): 1F1B-aware orchestrator over
   :class:`IntraCostModel`; the recommended public class for general use.
 

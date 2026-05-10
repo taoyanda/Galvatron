@@ -315,3 +315,245 @@ def test_dp_modes_isolated_in_breakdown(aggregator):
     # Shape C was profiled under zero3 only — only that mode appears.
     breakdown_c = runtime["by_shape"]["tp1_ep2_micro_bsz2_seq4096_fsepoff"]["unit_breakdown"]
     assert breakdown_c["dp_modes"] == ["zero3"]
+
+
+def test_unit_breakdown_pins_to_canonical_num_layers(aggregator):
+    """When the sweep runs at multiple ``num_layers`` (e.g. NUM_LAYERS_LIST=
+    "2 4"), per-component (attention/mlp) measurements exist at each N.
+    The aggregator must pin to a single canonical N (DEFAULT_NUM_LAYERS=4)
+    rather than averaging across N — averaging would silently halve the
+    per-layer cost the cost model derives via
+    ``attention_fwd_bwd_ms / unit_num_layers``.
+
+    Seeds matched (shape, dp_mode) pairs at nl=2 and nl=4 with distinct
+    fwd_bwd_ms; asserts the breakdown reflects only the nl=4 row."""
+    module, log_dir, configs_dir = aggregator
+    base_full = dict(
+        params=200.0, opt=400.0, act=1500.0, peak=8000.0,
+        opt_ms=20.0, iter_s=0.40,
+    )
+    # Same shape (tp=1, ep=2, bsz=4, fsep=off) at nl=2 and nl=4.
+    # nl=2 mlp rows have intentionally LARGER fwd_bwd_ms; if the
+    # aggregator averaged, the breakdown would land between the two
+    # values. Pinning to nl=4 must produce exactly the nl=4 numbers.
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl2.log",
+               fwd_bwd=145.0, **base_full)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl2_unitmlp.log",
+               fwd_bwd=99.0, **base_full)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl2_unitattention.log",
+               fwd_bwd=55.0, iter_s=0.20)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl4.log",
+               fwd_bwd=290.0, **base_full)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl4_unitmlp.log",
+               fwd_bwd=180.0, **base_full)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl4_unitattention.log",
+               fwd_bwd=110.0, iter_s=0.20)
+
+    module.main()
+    runtime = json.loads(
+        (configs_dir / f"runtime_profiling_{module.PRECISION}_{module.MODEL}.json").read_text()
+    )
+    shape_block = runtime["by_shape"]["tp1_ep2_micro_bsz4_seq4096_fsepoff"]
+    breakdown = shape_block["unit_breakdown"]["per_dp_mode"]["zero2sdp"]
+    assert breakdown["unit_num_layers"] == 4, (
+        f"unit_num_layers must be pinned to 4; got {breakdown['unit_num_layers']}"
+    )
+    assert breakdown["mlp_fwd_bwd_ms"] == pytest.approx(180.0), (
+        "mlp_fwd_bwd_ms must reflect the nl=4 row only (not the avg with nl=2)"
+    )
+    assert breakdown["attention_fwd_bwd_ms"] == pytest.approx(110.0), (
+        "attention_fwd_bwd_ms must reflect the nl=4 row only"
+    )
+    # The nl=2 sample should still appear in the runtime profile's
+    # samples_by_num_layers (used by α + β · N fitting), even though
+    # unit_breakdown pins to nl=4.
+    samples = shape_block["samples_by_num_layers"]
+    assert sorted(s["num_layers"] for s in samples) == [2, 4], (
+        "samples_by_num_layers must preserve both N points for the α + β fit"
+    )
+    # And the alpha_beta_fit must be present (≥ 2 N points).
+    assert "alpha_beta_fit" in shape_block, (
+        "alpha_beta_fit missing despite 2 N points being present"
+    )
+    # iter_ms fit: at nl=2 iter_ms=200ms, at nl=4 iter_ms=400ms (both seeded
+    # via iter_s=0.40 — wait, actually base_full has iter_s=0.40 for both,
+    # so both points at iter_ms=400ms, beta would be 0). Just check the fit
+    # entry exists for at least one field rather than a numerical value.
+    assert any("alpha" in fit for fit in shape_block["alpha_beta_fit"].values()), (
+        "alpha_beta_fit must contain at least one fitted field"
+    )
+
+
+def test_unit_breakdown_emits_per_component_memory_alpha_beta(aggregator):
+    """Memory side of unit_breakdown: per-component activation_peak_mb is
+    fit as α + β · N across all N values present (typically nl ∈ {2, 4}).
+
+    The new IntraCostModel reads ``mlp_act_alpha_beta`` and
+    ``attention_act_alpha_beta`` to derive per-layer-per-microbatch
+    activation memory at the query's stage layer count, replacing the
+    legacy ``profile_memory.sh`` (Step 4) data path.
+
+    Seeds matched (shape, dp_mode) per-component rows at nl=2 and nl=4
+    with distinct activation_peak_mb. Asserts:
+      - both `*_act_alpha_beta` fields appear with n_points=2
+      - α and β recover the seeded line exactly
+
+    Slope construction: at nl=2 mlp act=600, nl=4 mlp act=1000 → β=200,
+    α=200. attn act=300 at nl=2, act=500 at nl=4 → β=100, α=100. The
+    test pins the time side to nl=4 (existing behavior) but verifies
+    memory uses both N points.
+    """
+    module, log_dir, configs_dir = aggregator
+    # Time fields are arbitrary; we're not asserting on them here.
+    common = dict(params=200.0, opt=400.0, peak=8000.0, opt_ms=20.0, iter_s=0.40)
+    # nl=2 entries — smaller activation_peak_mb (per-layer × 2 + α).
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl2.log",
+               fwd_bwd=145.0, act=1100.0, **common)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl2_unitmlp.log",
+               fwd_bwd=99.0, act=600.0, **common)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl2_unitattention.log",
+               fwd_bwd=55.0, act=300.0, params=200.0, opt=400.0, peak=8000.0,
+               opt_ms=20.0, iter_s=0.20)
+    # nl=4 entries — larger activation_peak_mb (per-layer × 4 + α).
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl4.log",
+               fwd_bwd=290.0, act=1900.0, **common)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl4_unitmlp.log",
+               fwd_bwd=180.0, act=1000.0, **common)
+    _write_log(log_dir,
+               "cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepoff_nl4_unitattention.log",
+               fwd_bwd=110.0, act=500.0, params=200.0, opt=400.0, peak=8000.0,
+               opt_ms=20.0, iter_s=0.20)
+
+    module.main()
+    runtime = json.loads(
+        (configs_dir / f"runtime_profiling_{module.PRECISION}_{module.MODEL}.json").read_text()
+    )
+    breakdown = (
+        runtime["by_shape"]["tp1_ep2_micro_bsz4_seq4096_fsepoff"]
+        ["unit_breakdown"]["per_dp_mode"]["zero2sdp"]
+    )
+
+    assert "mlp_act_alpha_beta" in breakdown, (
+        "mlp_act_alpha_beta missing — new IntraCostModel needs it to "
+        "replace the Step 4 memory_profile per-component activation data"
+    )
+    mlp_fit = breakdown["mlp_act_alpha_beta"]
+    assert mlp_fit["n_points"] == 2, (
+        f"mlp fit must use both nl=2 and nl=4 points; got {mlp_fit['n_points']}"
+    )
+    assert mlp_fit["beta"] == pytest.approx(200.0), (
+        f"mlp β should recover the per-layer slope (1000-600)/(4-2)=200; "
+        f"got {mlp_fit['beta']}"
+    )
+    assert mlp_fit["alpha"] == pytest.approx(200.0), (
+        f"mlp α should be 600 - 2·200 = 200; got {mlp_fit['alpha']}"
+    )
+
+    assert "attention_act_alpha_beta" in breakdown, (
+        "attention_act_alpha_beta missing"
+    )
+    attn_fit = breakdown["attention_act_alpha_beta"]
+    assert attn_fit["n_points"] == 2
+    assert attn_fit["beta"] == pytest.approx(100.0), (
+        f"attention β should be (500-300)/(4-2)=100; got {attn_fit['beta']}"
+    )
+    assert attn_fit["alpha"] == pytest.approx(100.0), (
+        f"attention α should be 300 - 2·100 = 100; got {attn_fit['alpha']}"
+    )
+
+
+def test_chunks_overhead_emits_per_component_alloc_slopes(aggregator):
+    """The per-component chunks=1↔chunks=2 cuda_peak delta directly
+    measures per-microbatch activation per component. The IntraCostModel
+    consumes ``attention_alloc_per_extra_microbatch_mb`` and
+    ``mlp_alloc_per_extra_microbatch_mb`` for its 1F1B PP reserve
+    calculation under asymmetric layer-split queries.
+
+    Seeds matched chunks=1 / chunks=2 pairs at three profile_units (all,
+    attention, mlp) for one shape (tp=1, ep=2, micro_bsz=4, fsep=on,
+    pp=1, dp_mode=zero2sdp). Asserts:
+      - all-pass slope: cuda_peak delta / Δchunks
+      - attention slope: per-microbatch attention activation only
+      - mlp slope: per-microbatch mlp activation only
+      - physical sanity: attn + mlp ≈ all (sum-of-parts within tolerance)
+
+    Pairing key for attention drops fsep (attention is fsep-agnostic);
+    pairing for mlp keeps fsep. Test seeds use fsep=on for all three
+    components since the FSEP-on-only matrix doesn't produce fsep=off
+    rows.
+    """
+    module, log_dir, configs_dir = aggregator
+    common_full = dict(params=200.0, opt=400.0, opt_ms=20.0)
+
+    # Shape: tp=1 ep=2 zero2sdp fsep=on, micro_bsz=4 (chunks=1: bsz=4;
+    # chunks=2: bsz=8). Test seeds are at nl=2 (matching the chunks=2
+    # sweep's NUM_LAYERS_LIST="2"). chunks=1 main sweep produces both
+    # nl=2 and nl=4 logs; we seed only nl=2 here for the pairing.
+    #
+    # Seed values (cuda_peak_mb):
+    #   chunks=1:   all=8000   attention=4000   mlp=6000
+    #   chunks=2:   all=8500   attention=4150   mlp=6350
+    # → all_slope=500, attn_slope=150, mlp_slope=350. attn+mlp=500 ✓
+    chunks1_seeds = [
+        ("cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepon_nl2.log",
+         dict(fwd_bwd=290.0, act=1900.0, peak=8000.0, iter_s=0.40, **common_full)),
+        ("cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepon_nl2_unitattention.log",
+         dict(fwd_bwd=110.0, act=500.0, peak=4000.0, iter_s=0.20, **common_full)),
+        ("cost_model_real_tp1_ep2_zero2sdp_bsz4_fsepon_nl2_unitmlp.log",
+         dict(fwd_bwd=180.0, act=1000.0, peak=6000.0, iter_s=0.40, **common_full)),
+    ]
+    # chunks=2 logs: bsz=8 (= micro_bsz=4 × chunks=2).
+    chunks2_seeds = [
+        ("cost_model_real_tp1_ep2_zero2sdp_bsz8_fsepon_nl2_chunks2.log",
+         dict(fwd_bwd=580.0, act=1900.0, peak=8500.0, iter_s=0.85, **common_full)),
+        ("cost_model_real_tp1_ep2_zero2sdp_bsz8_fsepon_nl2_chunks2_unitattention.log",
+         dict(fwd_bwd=220.0, act=500.0, peak=4150.0, iter_s=0.40, **common_full)),
+        ("cost_model_real_tp1_ep2_zero2sdp_bsz8_fsepon_nl2_chunks2_unitmlp.log",
+         dict(fwd_bwd=360.0, act=1000.0, peak=6350.0, iter_s=0.80, **common_full)),
+    ]
+    for name, kwargs in chunks1_seeds + chunks2_seeds:
+        _write_log(log_dir, name, **kwargs)
+
+    module.main()
+    co = json.loads(
+        (configs_dir / f"chunks_overhead_profiling_{module.PRECISION}_{module.MODEL}.json").read_text()
+    )
+    shape_block = co["by_shape"]["tp1_ep2_micro_bsz4_seq4096_fsepon"]
+    dp_block = shape_block["per_dp_mode"]["zero2sdp"]
+
+    assert dp_block["alloc_per_extra_microbatch_mb"] == pytest.approx(500.0), (
+        f"all-pass slope (8500-8000)/(2-1) should be 500; "
+        f"got {dp_block['alloc_per_extra_microbatch_mb']}"
+    )
+    assert dp_block["attention_alloc_per_extra_microbatch_mb"] == pytest.approx(150.0), (
+        f"attention slope (4150-4000)/(2-1) should be 150; "
+        f"got {dp_block['attention_alloc_per_extra_microbatch_mb']}"
+    )
+    assert dp_block["mlp_alloc_per_extra_microbatch_mb"] == pytest.approx(350.0), (
+        f"mlp slope (6350-6000)/(2-1) should be 350; "
+        f"got {dp_block['mlp_alloc_per_extra_microbatch_mb']}"
+    )
+    # Physical sanity: per-component slopes sum to within tolerance of
+    # the all-pass slope. They needn't be exactly equal — the all-pass
+    # model has both attn and mlp layers in the same iter, while the
+    # per-component models each have only their own layer type, so
+    # workspace overhead may differ. But they should be close.
+    summed = (dp_block["attention_alloc_per_extra_microbatch_mb"]
+              + dp_block["mlp_alloc_per_extra_microbatch_mb"])
+    assert summed == pytest.approx(
+        dp_block["alloc_per_extra_microbatch_mb"], rel=0.10
+    ), (
+        f"attn+mlp slopes ({summed}) should approximate all-pass "
+        f"({dp_block['alloc_per_extra_microbatch_mb']}) within 10%"
+    )

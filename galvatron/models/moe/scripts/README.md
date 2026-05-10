@@ -17,14 +17,18 @@ Numbered steps mirror the workflow doc.
 | 5 | `profile_embedding_lmhead.py` | Embedding + LM-head standalone time/memory profile |
 | ~~6~~ | ~~`profile_computation_frozen.sh`~~ | **Legacy** — moved to `_legacy/`. FSEP-on per-block fwd-only compute profile. Subsumed by Step 8: runtime_profile captures FSEP-on full-iter measurements at every (tp, ep, micro_bsz, fsep=on, pp) shape, and `fsep_overhead_profile` is built from those FSEP-on/off pairs (not from this script's output). |
 | ~~7~~ | ~~`profile_memory_frozen.sh`~~ | **Legacy** — moved to `_legacy/`. FSEP-on memory profile. Output (`memory_profiling_*_fsep.json` and `memory_profiling_*_tp{T}_ep{E}_fsep.json`) was never read by the cost model — every `memory_profile` lookup in `intra.py` uses non-fsep filenames. FSEP-on memory predictions are sourced from runtime_profile (full-iter `cuda_peak_mb` with α + β · N fitting) and `fsep_overhead_profile`. |
-| 8 | `cost_model_real_test.sh` | **Calibration sweep** — per-config (pp, tp, ep, dp_mode, micro_bsz, fsep, profile_unit) full-iter measurements. Per-component fan-out (all/attention/mlp); covers gbsz ∈ {4, 2, 1} (gap-fill folded in); sweeps `NUM_LAYERS_LIST="2 4"` for the α + β × N fit |
-| 8b | `cost_model_real_test_chunks2.sh` | **Per-microbatch overhead calibration** — runs the matrix at chunks=2 to derive `chunks_overhead_profiling_*.json` |
-| ~~8c~~ | ~~`cost_model_real_test_gap_fill.sh`~~ | **Folded into Step 8** — moved to `_legacy/`. The gbsz ∈ {1, 2} entries are now part of `DEFAULT_CONFIGS_BASE` in `cost_model_real_test.sh`, so the main sweep covers shape gaps directly. zero3 entries dropped on merge (consistent with the zero2sdp-only directive). |
+| 8 | `cost_model_real_test.sh` | **World=4 PP=1 calibration** — full-iter measurements at `(pp=1, tp, ep, dp_mode, micro_bsz, fsep)` × `NUM_LAYERS_LIST="2 4"`. Default `DEFAULT_PROFILE_UNITS="all"` (single pass; opt-in to `"all attention mlp"` for asymmetric search). Logs without `_w` tag = world=4. |
+| 8 | `cost_model_real_test_w2.sh` | **World=2 PP=1 calibration** — same matrix narrowed to feasible world=2 shapes. Provides the **matching-shape** lookup that PP=2 4-GPU stage compute reads via `cost_model/pp.py`. Logs tagged `_w2`. |
+| 8 | `cost_model_real_test_w1.sh` | **World=1 PP=1 calibration** — single-GPU FSEP-off. Provides the matching-shape lookup for PP=4. Logs tagged `_w1`. |
+| 8 | `cost_model_real_test_pp2.sh` | **Opt-in legacy PP=2 calibration** — preserves the historical PP=2 same-world data path for cross-checks; not part of minimum-working profiling. |
+| 8b | `cost_model_real_test_chunks2.sh` + `_w2.sh` + `_w1.sh` | Per-microbatch overhead at chunks=2, mirroring the three world matrices. |
+| ~~8c~~ | ~~`cost_model_real_test_gap_fill.sh`~~ | **Folded into Step 8** — moved to `_legacy/`. |
 | 9 | `profile_cost_model_terms.py` | Aggregator: turns step-8 logs into `optimizer_step_profiling`, `runtime_profiling`, `fsep_overhead_profiling`, `chunks_overhead_profiling` JSONs |
 | 10 | `cost_model_alpha_beta.py` | α + β × N extrapolation drift check |
 | 10 | `cost_model_pp_drift.py` | PP critical-path drift check |
 | 10 | `cost_model_split_regression.py` | Symmetric identity / regression invariants (24 checks) |
 | 10 | `cost_model_drift.py` | Per-shape drift table |
+| 10 | `validate_unseen_drift.py` | **Multi-world matching-shape drift** — 6-config matrix at `nl=12` validating PP > 1 prediction via the shrunk-world calibration. Auto-runs missing trainer measurements. After Step 8 multi-world sweep, reports `max |Δt| ≤ 7.7 %` (PP=2 cases ≤ 5.1 %; PP=1 baseline -7.7 %). See workflow doc Step 10.5. |
 | 11 | `cost_model_search.py` | Brute-force search over the (pp, tp, ep, dp, dp_mode, fsep) layout space |
 | 11b | `cost_model_search_micro_bsz_sweep.py` | Compares optimal config across micro_bsz ∈ {1, 2, 4} at fixed gbsz |
 | 11c | `validate_top_config.sh` | End-to-end validation: real training run at the search's top config; compares measured iter_ms against predicted |

@@ -74,32 +74,16 @@ class IntraCostModel(ICostModel):
         self.meta = self._load_json(
             os.path.join(self.meta_dir, f"{model_name}.json")
         )
-        # Path search order mirrors the compute-profile loader at
-        # ``_compute_profile_path``: try the seqlen-suffixed file first
-        # (the profiler's ``model_name(config, args)`` appends
-        # ``_seqlen{max_position_embeddings}`` whenever profile_mode !=
-        # "sequence", per ``meta_configs/config_utils.py:164``), then
-        # fall back to the legacy seqlen-less path so existing bundles
-        # built from older sweeps keep working.
-        _seqlen_for_path = int(self.meta.get("max_position_embeddings", 4096))
-        self.memory_profile = self._load_json_first_existing([
-            os.path.join(
-                self.configs_dir,
-                f"memory_profiling_{mixed_precision}_{model_name}_seqlen{_seqlen_for_path}.json",
-            ),
-            os.path.join(
-                self.configs_dir,
-                f"memory_profiling_{mixed_precision}_{model_name}.json",
-            ),
-            os.path.join(
-                self.configs_dir, "non-solver",
-                f"memory_profiling_{mixed_precision}_{model_name}_seqlen{_seqlen_for_path}.json",
-            ),
-            os.path.join(
-                self.configs_dir, "non-solver",
-                f"memory_profiling_{mixed_precision}_{model_name}.json",
-            ),
-        ])
+        # ``memory_profile`` is the legacy ``profile_memory.sh`` (Step 4)
+        # output. The base ``IntraCostModel`` doesn't read it — the
+        # methods that consumed it (``_memory_for_seq``,
+        # ``per_microbatch_activation_mb``, ``per_layer_act_alpha_beta``,
+        # ``attention_mlp_act_ratio``) are stubbed at this layer and
+        # implemented by :class:`IntraCostModelMeasuredAct` (which loads
+        # ``memory_profile`` in its own ``__init__``). The base class'
+        # corresponding analytical / chunks_overhead path is delivered
+        # in step 2b.2.
+        self.memory_profile: Optional[Dict[str, Any]] = None
         self.optimizer_step_profile: Optional[Dict[str, Any]] = self._try_load(
             os.path.join(
                 self.configs_dir,
@@ -324,6 +308,15 @@ class IntraCostModel(ICostModel):
         n_high, ms_high = layer_count_to_time[-1]
         return (ms_high - ms_low) / (n_high - n_low)
 
+    # Per-microbatch slope below this is treated as noise floor and
+    # discarded in favor of the closed-form analytical path. Empirically
+    # PP=2 chunks_overhead measurements at 4-GPU calibration land near 0
+    # (or slightly negative) due to allocator-state variance dominating
+    # the small per-microbatch delta — see findings 1 and 2 in the
+    # step-2b sweep analysis. PP=1 measurements are typically ~hundreds
+    # of MB per microbatch per layer-equivalent.
+    _CHUNKS_OVERHEAD_NOISE_FLOOR_MB = 50.0
+
     def per_microbatch_activation_mb(
         self, *,
         num_layers: int,
@@ -334,12 +327,22 @@ class IntraCostModel(ICostModel):
         sequence_parallel: bool = True,
     ) -> float:
         """Activation memory (MB) held by one stage of ``num_layers``
-        layers per microbatch in flight, at the given shape.
+        layers per microbatch in flight, at the given shape. Used by
+        :class:`PPCostModel`'s ``num_stages_behind`` reserve calculation.
 
-        ``per_rank_micro_bsz`` is the per-actual-rank sample count per
-        microbatch step (= ``micro_batch_size // (dp * ep)`` since both
-        DP and EP shard the data dim). Used by :class:`PPCostModel`'s
-        ``num_stages_behind`` reserve calculation.
+        Analytical implementation — boundary-tensor formula under
+        recompute. For higher-precision measured values, callers with
+        shape context (tp, ep, micro_bsz, fsep, pp, dp_mode) should
+        consult ``chunks_overhead_profile`` directly before falling back
+        to this method (the function signature is shape-agnostic by
+        design — pp.py owns the chunks_overhead lookup).
+
+        Returns ``num_layers × per_rank_micro_bsz × per_layer_act_per_bsz_mb``
+        where ``per_layer_act_per_bsz_mb`` is the boundary tensor at
+        (seq_len, hidden, bf16) divided by tp under SP. Under no-recompute
+        this under-predicts (interior activations not modeled
+        analytically); the calibration sweep always runs with recompute,
+        so the recompute=True path is the production case.
         """
         mem = self._memory_for_seq(seq_len, sequence_parallel=sequence_parallel)
         act_dict = mem["act_per_bsz_by_tp"]
@@ -353,181 +356,237 @@ class IntraCostModel(ICostModel):
         return num_layers * act_per_layer_per_bsz * per_rank_micro_bsz
 
     def _memory_for_seq(self, seq_len, sequence_parallel=True):
-        sp = "_sp" if sequence_parallel else ""
-        layer_key = f"layertype_0{sp}"
-        if layer_key not in self.memory_profile:
-            raise KeyError(f"Memory profile missing key {layer_key!r}")
-        layer = self.memory_profile[layer_key][str(seq_len)]
+        """Analytical memory profile derived from ``self.meta``.
+
+        Schema matches the legacy (memory_profile-based) version so
+        consumers in :meth:`stage_memory` don't need code changes:
+
+          - ``param_per_layer_unsharded_mb``: bf16 params per transformer
+            block (attention QKV+O + experts × 3 × hidden × intermediate
+            + router + 2 layer norms).
+          - ``act_per_bsz_by_tp``: dict ``{tp: per-bsz boundary tensor}``
+            for tp ∈ {1, 2, 4, 8}. Boundary-only — interior activations
+            (no-recompute regime) aren't modeled.
+          - ``act_per_bsz_checkpoint``: per-bsz boundary tensor at tp=1
+            (recompute regime; SP scaling applied in
+            :meth:`per_microbatch_activation_mb`).
+          - ``other_off`` / ``other_first`` / ``other_last``: embed +
+            lmhead bucket (model_states + activation per tp). Embed
+            sharded by tp (≈ vocab_tp); LM-head similarly.
+
+        Replaces the legacy ``profile_memory.sh`` (Step 4) JSON read.
+        For consumers that need higher-precision interior-activation
+        values under no-recompute queries (rare), use
+        :class:`IntraCostModelMeasuredAct` instead.
+        """
+        hidden = float(self.meta["hidden_size"])
+        intermediate = float(self.meta["intermediate_size"])
+        num_attn_heads = int(self.meta["num_attention_heads"])
+        num_kv_heads = int(self.meta.get("num_key_value_heads", num_attn_heads))
+        head_dim = int(self.meta.get("head_dim", int(hidden) // num_attn_heads))
+        num_experts = int(self.meta.get("num_local_experts", 1))
+        vocab = int(self.meta["vocab_size"])
+        elem_bytes = 2  # bf16
+
+        # Per-layer unsharded params. Same parameter accounting as
+        # MoEModel's transformer block: GQA attention (Q wide, KV
+        # narrower), 128-expert SwiGLU MLP, router, 2 RMSNorm.
+        attn_params = (
+            hidden * num_attn_heads * head_dim       # Q
+            + hidden * num_kv_heads * head_dim       # K
+            + hidden * num_kv_heads * head_dim       # V
+            + num_attn_heads * head_dim * hidden     # O
+        )
+        expert_params = num_experts * 3 * hidden * intermediate
+        router_params = hidden * num_experts
+        layer_norm_params = 2 * hidden  # input_norm + post_attn_norm
+        per_layer_params_unsharded = (
+            attn_params + expert_params + router_params + layer_norm_params
+        )
+        param_per_layer_unsharded_mb = (
+            per_layer_params_unsharded * elem_bytes / 1024.0**2
+        )
+
+        # Boundary tensor under recompute: bsz × seq × hidden × elem_bytes.
+        # Per-bsz, per-layer, before TP/SP sharding.
+        boundary_per_bsz_no_sp_mb = (
+            seq_len * hidden * elem_bytes / 1024.0**2
+        )
+        # tp_activation_per_bsz_dict: legacy schema returns one value
+        # per tp shard. Under SP, divide by tp; without SP, no shard.
+        act_per_bsz_by_tp = {
+            tp_v: (
+                boundary_per_bsz_no_sp_mb / tp_v
+                if sequence_parallel else boundary_per_bsz_no_sp_mb
+            )
+            for tp_v in (1, 2, 4, 8)
+        }
+        # ``act_per_bsz_checkpoint`` mirrors the legacy field —
+        # boundary tensor at tp=1 (the recompute path's per-layer
+        # cost). The :meth:`per_microbatch_activation_mb` consumer
+        # divides by ``tp_sp_div`` itself when SP applies.
+        act_per_bsz_checkpoint = boundary_per_bsz_no_sp_mb
+
+        # Embed / lm-head bucket. Model states under each tp shard:
+        # bf16 params (vocab × hidden / tp) + Adam state. Activation:
+        # boundary tensor between embed/lm-head and the adjacent
+        # transformer block (per-bsz; consumer scales by per_rank_bsz).
+        embed_unsharded_params_bytes = vocab * hidden * elem_bytes
+        lmhead_unsharded_params_bytes = embed_unsharded_params_bytes  # untied
+
+        def _other_block(params_bytes: float) -> Dict[str, Dict[str, float]]:
+            block: Dict[str, Dict[str, float]] = {
+                "model_states": {}, "activation": {},
+            }
+            for tp_v in (1, 2, 4, 8):
+                sharded_params_mb = params_bytes / tp_v / 1024.0**2
+                # Model state = sharded params × (1 + optimizer/params ratio).
+                ms_mb = sharded_params_mb * (
+                    1.0 + self.optimizer_to_params_ratio
+                )
+                act_mb = (
+                    boundary_per_bsz_no_sp_mb / tp_v
+                    if sequence_parallel else boundary_per_bsz_no_sp_mb
+                )
+                block["model_states"][str(tp_v)] = ms_mb
+                block["activation"][str(tp_v)] = act_mb
+            return block
+
         return {
-            "param_per_layer_unsharded_mb": float(layer["parameter_size"]),
-            "act_per_bsz_by_tp": {
-                int(k): float(v)
-                for k, v in layer["tp_activation_per_bsz_dict"].items()
-                if k != "checkpoint"
-            },
-            "act_per_bsz_checkpoint": float(
-                layer["tp_activation_per_bsz_dict"]["checkpoint"]
+            "param_per_layer_unsharded_mb": param_per_layer_unsharded_mb,
+            "act_per_bsz_by_tp": act_per_bsz_by_tp,
+            "act_per_bsz_checkpoint": act_per_bsz_checkpoint,
+            # PP=1: both embed and lm-head live on the same stage.
+            "other_off": _other_block(
+                embed_unsharded_params_bytes + lmhead_unsharded_params_bytes
             ),
-            "other_off": self.memory_profile[f"other_memory_pp_off{sp}"][str(seq_len)],
-            "other_first": self.memory_profile[f"other_memory_pp_on_first{sp}"][str(seq_len)],
-            "other_last": self.memory_profile[f"other_memory_pp_on_last{sp}"][str(seq_len)],
+            # PP first stage: embed only.
+            "other_first": _other_block(embed_unsharded_params_bytes),
+            # PP last stage: lm-head only.
+            "other_last": _other_block(lmhead_unsharded_params_bytes),
         }
 
     def attention_mlp_act_ratio(
         self, tp: int, ep: int, micro_bsz: int, seq_len: int,
         sequence_parallel: bool = True,
     ) -> Optional[Tuple[float, float]]:
-        """Return ``(ratio_attn, ratio_mlp)`` for activation memory at this
-        shape, or ``None`` when per-component memory data isn't present.
+        """Per-component activation split as ``(ratio_attn, ratio_mlp)``.
 
-        Reads the raw per-rank ``layernum[N]_bsz<B>_seq<S>_<unit>_rank0_act``
-        keys produced by ``profile_memory.sh`` running the three passes
-        (``all``, ``attention``, ``mlp``). The cost model uses this to
-        split activation memory under asymmetric-layer queries; when
-        absent, the caller falls back to the per-component time ratio
-        (a coarser proxy).
+        Derived from :meth:`per_layer_act_alpha_beta` β values for
+        each component. Returns ``None`` only if both components miss
+        a slope (chunks_overhead absent and analytical fallback fails).
         """
-        raw_path = self._raw_memory_path(tp, ep)
-        if not os.path.isfile(raw_path):
+        attn_ab = self.per_layer_act_alpha_beta(
+            unit="attention", tp=tp, ep=ep, micro_bsz=micro_bsz,
+            seq_len=seq_len, recompute=True,
+            sequence_parallel=sequence_parallel,
+        )
+        mlp_ab = self.per_layer_act_alpha_beta(
+            unit="mlp", tp=tp, ep=ep, micro_bsz=micro_bsz,
+            seq_len=seq_len, recompute=True,
+            sequence_parallel=sequence_parallel,
+        )
+        if attn_ab is None or mlp_ab is None:
             return None
-        raw = self._load_json(raw_path)
-        # Strategy key: 1_<tp>_<dp>[_sp]; for memory profile we need the
-        # row that ran with this tp at pp=1 (memory profiling default).
-        # Walk every top-level strategy key and extract the matching seq.
-        attn_acts: List[float] = []
-        mlp_acts: List[float] = []
-        sp_marker = "_sp" if sequence_parallel else ""
-        for strategy_key, entries in raw.items():
-            if not strategy_key.startswith("1_"):
-                continue
-            # Gate on the SP marker so we don't mix sp/non-sp rows.
-            ends_sp = strategy_key.endswith("_sp")
-            if sp_marker and not ends_sp:
-                continue
-            if not sp_marker and ends_sp:
-                continue
-            for layernum in (1, 2):
-                attn_key = (
-                    f"layernum[{layernum}]_bsz{micro_bsz}_seq{seq_len}"
-                    f"_attention_rank0_act"
-                )
-                mlp_key = (
-                    f"layernum[{layernum}]_bsz{micro_bsz}_seq{seq_len}"
-                    f"_mlp_rank0_act"
-                )
-                if attn_key in entries and mlp_key in entries:
-                    attn_acts.append(float(entries[attn_key]))
-                    mlp_acts.append(float(entries[mlp_key]))
-        if not attn_acts or not mlp_acts:
+        attn_beta = attn_ab[1]
+        mlp_beta = mlp_ab[1]
+        if attn_beta <= 0 or mlp_beta <= 0:
             return None
-        # Per-layer slope: average across collected (layernum, strategy)
-        # samples. Activation memory at fixed bsz/seq scales linearly
-        # with num_layers, so each sample independently estimates the
-        # split — the average smooths per-rank noise.
-        attn_avg = sum(attn_acts) / len(attn_acts)
-        mlp_avg = sum(mlp_acts) / len(mlp_acts)
-        if attn_avg <= 0 or mlp_avg <= 0:
-            return None
-        total = attn_avg + mlp_avg
-        return attn_avg / total, mlp_avg / total
+        total = attn_beta + mlp_beta
+        return attn_beta / total, mlp_beta / total
 
     def per_layer_act_alpha_beta(
         self, *, unit: Literal["attention", "mlp"],
         tp: int, ep: int, micro_bsz: int, seq_len: int,
         recompute: bool = False, sequence_parallel: bool = True,
     ) -> Optional[Tuple[float, float]]:
-        """OLS ``(α, β)`` for the per-layer activation MB of one
-        component (``unit="attention"`` or ``"mlp"``) at the profiled
-        ``micro_bsz``.
+        """``(α, β)`` for per-layer activation MB of one component.
 
-        Each component is fit independently across ``layernum[N]``
-        samples in the raw memory profile. The α and β for attention
-        are physically distinct from those for expert MLP (different
-        sublayers, different per-rank overheads); this method makes
-        that explicit by parameterizing on ``unit`` rather than
-        sharing or averaging across components.
+        Source priority:
+          1. ``chunks_overhead_profile.{unit}_alloc_per_extra_microbatch_mb``
+             at the matching ``shape_key`` and ``dp_mode``. The slope is
+             a measured per-microbatch reserve (chunks=2 vs chunks=1
+             cuda_peak delta on the unit-only model), which under 1F1B
+             is the per-microbatch activation cost stripped of
+             grad-bucket noise. Divided by the calibration ``num_layers``
+             to give per-layer-per-microbatch slope, then by ``micro_bsz``
+             to give per-layer-per-bsz (the schema this method returns).
+             Discarded if below ``_CHUNKS_OVERHEAD_NOISE_FLOOR_MB`` or
+             non-positive — empirically PP=2 entries land near zero on
+             4-GPU calibration.
+          2. Analytical closed-form: boundary tensor under recompute.
+             For ``unit=attention``, this is the same boundary as for
+             ``unit=mlp`` under recompute (no per-component split when
+             only the boundary is retained). The closed-form is
+             ``(seq × hidden × 2 / tp_sp_div) × micro_bsz`` MB.
 
-        Strategy keys follow ``"<pp>_<tp>_<dp>"`` plus optional ``_c``
-        (recompute) and ``_sp`` (sequence parallel) markers. We gate
-        on the ``_c`` marker so the recompute and no-recompute regimes
-        don't mix — they're physically different memory profiles.
+        Returns ``(α, β)`` where ``α=0`` (no per-iter offset under
+        recompute calibration) and ``β`` is the per-layer slope.
 
-        Returns ``None`` when the three-pass profile hasn't been run
-        at this shape (or under the requested recompute mode). Per-bsz
-        scaling (``/ micro_bsz``) is the caller's responsibility.
+        Note: under recompute, attention and mlp boundary tensors are
+        identical (both retain only input-to-layer activation), so the
+        analytical fallback returns the same β for both. The
+        chunks_overhead-anchored path picks up the real per-component
+        difference (mlp's grad bucket + dispatcher buffers vs attention's
+        smaller footprint) when measured data is available.
         """
-        raw_path = self._raw_memory_path(tp, ep)
-        if not os.path.isfile(raw_path):
-            return None
-        raw = self._load_json(raw_path)
-        sp_marker = "_sp" if sequence_parallel else ""
-        cpt_marker = "_c" if recompute else ""
-        samples_by_n: Dict[int, List[float]] = {}
-        for strategy_key, entries in raw.items():
-            if not strategy_key.startswith("1_"):
-                continue
-            base = (
-                strategy_key[:-3]
-                if strategy_key.endswith("_sp") else strategy_key
-            )
-            ends_cpt = base.endswith("_c")
-            if cpt_marker and not ends_cpt:
-                continue
-            if not cpt_marker and ends_cpt:
-                continue
-            ends_sp = strategy_key.endswith("_sp")
-            if (sp_marker and not ends_sp) or (not sp_marker and ends_sp):
-                continue
-            expected_tail = (
-                f"_bsz{micro_bsz}_seq{seq_len}_{unit}_rank0_act"
-            )
-            for key, value in entries.items():
-                if not key.startswith("layernum["):
-                    continue
-                if not key.endswith(expected_tail):
-                    continue
-                try:
-                    n = int(key[len("layernum["):key.index("]")])
-                except ValueError:
-                    continue
-                samples_by_n.setdefault(n, []).append(float(value))
-        if not samples_by_n:
-            return None
-        # OLS over averaged-by-N samples. With ≥ 2 distinct N values
-        # we get a real (α, β); with one N value we degrade to a
-        # through-origin slope (α = 0, β = y / N).
-        averaged = sorted(
-            (float(n), sum(vals) / len(vals))
-            for n, vals in samples_by_n.items()
-        )
-        if len(averaged) >= 2:
-            mean_n = sum(n for n, _ in averaged) / len(averaged)
-            mean_y = sum(y for _, y in averaged) / len(averaged)
-            cov = sum((n - mean_n) * (y - mean_y) for n, y in averaged)
-            var = sum((n - mean_n) ** 2 for n, _ in averaged)
-            if var <= 0:
-                return None
-            beta = cov / var
-            alpha = mean_y - beta * mean_n
-        else:
-            n, y = averaged[0]
-            if n <= 0:
-                return None
-            alpha, beta = 0.0, y / n
-        if beta <= 0:
-            return None
-        return alpha, beta
+        # Schema reminder: legacy returned β = per-layer activation MB
+        # AT the requested ``micro_bsz`` (not per-bsz). Consumer at
+        # intra.py:1121 divides β by ``per_rank_micro_bsz`` to recover
+        # per-bsz, then multiplies back by per_rank_micro_bsz × N at
+        # intra.py:1176. We must match that contract: return
+        # ``β = per_layer_per_bsz × micro_bsz``.
 
-    def _raw_memory_path(self, tp: int, ep: int) -> str:
-        """Path to the raw per-(tp, ep) memory profile JSON written by
-        ``utils.save_profiled_memory``."""
-        suffix = "" if (tp == 1 and ep == 1) else f"_tp{tp}_ep{ep}"
-        return os.path.join(
-            self.configs_dir,
-            f"memory_profiling_{self.mixed_precision}_{self.model_name}"
-            f"_seqlen{self.meta.get('max_position_embeddings', 4096)}"
-            f"{suffix}.json",
+        # --- Path 1: chunks_overhead per-component slope ---
+        co = self.chunks_overhead_profile or {}
+        # Resolve dp_mode preference: zero2sdp first, then zero3 — the
+        # main matrix is zero2sdp-only, so zero2sdp is the canonical
+        # source. Try fsep=on first (matrix is FSEP-on except gbsz=1),
+        # then fsep=off.
+        for fsep in ("on", "off"):
+            shape_key = (
+                f"tp{tp}_ep{ep}_micro_bsz{micro_bsz}_seq{seq_len}_fsep{fsep}"
+            )
+            shape_block = co.get("by_shape", {}).get(shape_key)
+            if shape_block is None:
+                continue
+            for dp_mode in ("zero2sdp", "zero3"):
+                dp_block = shape_block.get("per_dp_mode", {}).get(dp_mode)
+                if dp_block is None:
+                    continue
+                slope_per_mb = dp_block.get(
+                    f"{unit}_alloc_per_extra_microbatch_mb"
+                )
+                if slope_per_mb is None:
+                    continue
+                if slope_per_mb < self._CHUNKS_OVERHEAD_NOISE_FLOOR_MB:
+                    continue
+                nl_cal = dp_block.get("num_layers", 1) or 1
+                # slope_per_mb is the per-microbatch reserve for
+                # ``nl_cal`` layers at THIS shape's micro_bsz (the
+                # shape_key matched on micro_bsz). Per-layer at the
+                # calibration micro_bsz = slope_per_mb / nl_cal —
+                # which IS β at the consumer's expected micro_bsz
+                # (the lookup was keyed on it).
+                per_layer_at_bsz = slope_per_mb / float(nl_cal)
+                if per_layer_at_bsz <= 0:
+                    continue
+                return 0.0, per_layer_at_bsz
+
+        # --- Path 2: analytical fallback (boundary tensor under recompute) ---
+        hidden = float(self.meta.get("hidden_size", 0))
+        if hidden <= 0:
+            return None
+        elem_bytes = 2  # bf16
+        tp_sp_div = float(tp) if sequence_parallel and tp > 1 else 1.0
+        per_bsz_per_layer_mb = (
+            seq_len * hidden * elem_bytes / 1024.0**2 / tp_sp_div
         )
+        if per_bsz_per_layer_mb <= 0:
+            return None
+        # Return β at micro_bsz (consumer divides by micro_bsz to
+        # recover per-bsz). Matches legacy contract.
+        return 0.0, per_bsz_per_layer_mb * float(max(micro_bsz, 1))
 
     # ---------- embed / lm-head split ----------
 
@@ -1299,20 +1358,225 @@ class IntraCostModelMeasuredAct(IntraCostModel):
     per-component activation splits from ``profile_memory.sh``'s output
     (``memory_profiling_*.json`` and the per-(tp, ep) raw files).
 
-    This subclass exists for backward compatibility and for parity
-    comparisons during the IntraCostModel refactor that retires
-    ``profile_memory.sh`` (Step 4) from the standard workflow. The base
-    :class:`IntraCostModel` will (in step 2b) source per-microbatch
-    activation from ``chunks_overhead_profile`` (Step 8b per-component
-    slopes) and analytical formulas instead — making
-    ``profile_memory.sh`` optional. Until step 2b lands, this class is
-    a behavior-identical alias of the parent: the parent still loads
-    ``memory_profile`` and the four legacy methods
-    (``_memory_for_seq``, ``per_microbatch_activation_mb``,
-    ``per_layer_act_alpha_beta``, ``attention_mlp_act_ratio``) read
-    from it.
+    This subclass preserves the pre-refactor behavior. The base
+    :class:`IntraCostModel`'s analytical / chunks_overhead path
+    (step 2b.2) is the recommended path going forward; this subclass
+    remains for parity comparisons and for environments that still
+    have ``profile_memory.sh`` data on disk.
 
     Selected by ``PPCostModel(..., use_measured_memory_profile=True)``,
     which is the current default for backward compatibility.
     """
-    pass
+
+    def __init__(
+        self,
+        model_name: str,
+        mixed_precision: str = "bf16",
+        configs_dir: Optional[str] = None,
+        meta_dir: Optional[str] = None,
+    ):
+        super().__init__(model_name, mixed_precision, configs_dir, meta_dir)
+        # Path search order mirrors the compute-profile loader at
+        # ``_compute_profile_path``: try the seqlen-suffixed file first
+        # (the profiler's ``model_name(config, args)`` appends
+        # ``_seqlen{max_position_embeddings}`` whenever profile_mode !=
+        # "sequence", per ``meta_configs/config_utils.py:164``), then
+        # fall back to the legacy seqlen-less path so existing bundles
+        # built from older sweeps keep working.
+        seqlen_for_path = int(self.meta.get("max_position_embeddings", 4096))
+        self.memory_profile = self._load_json_first_existing([
+            os.path.join(
+                self.configs_dir,
+                f"memory_profiling_{mixed_precision}_{model_name}_seqlen{seqlen_for_path}.json",
+            ),
+            os.path.join(
+                self.configs_dir,
+                f"memory_profiling_{mixed_precision}_{model_name}.json",
+            ),
+            os.path.join(
+                self.configs_dir, "non-solver",
+                f"memory_profiling_{mixed_precision}_{model_name}_seqlen{seqlen_for_path}.json",
+            ),
+            os.path.join(
+                self.configs_dir, "non-solver",
+                f"memory_profiling_{mixed_precision}_{model_name}.json",
+            ),
+        ])
+
+    def per_microbatch_activation_mb(
+        self, *,
+        num_layers: int,
+        per_rank_micro_bsz: int,
+        seq_len: int,
+        tp: int,
+        recompute: bool,
+        sequence_parallel: bool = True,
+    ) -> float:
+        """Activation memory (MB) held by one stage of ``num_layers``
+        layers per microbatch in flight, at the given shape.
+
+        ``per_rank_micro_bsz`` is the per-actual-rank sample count per
+        microbatch step (= ``micro_batch_size // (dp * ep)`` since both
+        DP and EP shard the data dim). Used by :class:`PPCostModel`'s
+        ``num_stages_behind`` reserve calculation.
+        """
+        mem = self._memory_for_seq(seq_len, sequence_parallel=sequence_parallel)
+        act_dict = mem["act_per_bsz_by_tp"]
+        if recompute:
+            act_per_layer_per_bsz = mem["act_per_bsz_checkpoint"]
+        elif tp in act_dict:
+            act_per_layer_per_bsz = act_dict[tp]
+        else:
+            closest = min(act_dict.keys(), key=lambda k: abs(k - tp))
+            act_per_layer_per_bsz = act_dict[closest] * closest / tp
+        return num_layers * act_per_layer_per_bsz * per_rank_micro_bsz
+
+    def _memory_for_seq(self, seq_len, sequence_parallel=True):
+        sp = "_sp" if sequence_parallel else ""
+        layer_key = f"layertype_0{sp}"
+        if layer_key not in self.memory_profile:
+            raise KeyError(f"Memory profile missing key {layer_key!r}")
+        layer = self.memory_profile[layer_key][str(seq_len)]
+        return {
+            "param_per_layer_unsharded_mb": float(layer["parameter_size"]),
+            "act_per_bsz_by_tp": {
+                int(k): float(v)
+                for k, v in layer["tp_activation_per_bsz_dict"].items()
+                if k != "checkpoint"
+            },
+            "act_per_bsz_checkpoint": float(
+                layer["tp_activation_per_bsz_dict"]["checkpoint"]
+            ),
+            "other_off": self.memory_profile[f"other_memory_pp_off{sp}"][str(seq_len)],
+            "other_first": self.memory_profile[f"other_memory_pp_on_first{sp}"][str(seq_len)],
+            "other_last": self.memory_profile[f"other_memory_pp_on_last{sp}"][str(seq_len)],
+        }
+
+    def attention_mlp_act_ratio(
+        self, tp: int, ep: int, micro_bsz: int, seq_len: int,
+        sequence_parallel: bool = True,
+    ) -> Optional[Tuple[float, float]]:
+        """Return ``(ratio_attn, ratio_mlp)`` for activation memory at this
+        shape, or ``None`` when per-component memory data isn't present.
+
+        Reads the raw per-rank ``layernum[N]_bsz<B>_seq<S>_<unit>_rank0_act``
+        keys produced by ``profile_memory.sh`` running the three passes
+        (``all``, ``attention``, ``mlp``).
+        """
+        raw_path = self._raw_memory_path(tp, ep)
+        if not os.path.isfile(raw_path):
+            return None
+        raw = self._load_json(raw_path)
+        attn_acts: List[float] = []
+        mlp_acts: List[float] = []
+        sp_marker = "_sp" if sequence_parallel else ""
+        for strategy_key, entries in raw.items():
+            if not strategy_key.startswith("1_"):
+                continue
+            ends_sp = strategy_key.endswith("_sp")
+            if sp_marker and not ends_sp:
+                continue
+            if not sp_marker and ends_sp:
+                continue
+            for layernum in (1, 2):
+                attn_key = (
+                    f"layernum[{layernum}]_bsz{micro_bsz}_seq{seq_len}"
+                    f"_attention_rank0_act"
+                )
+                mlp_key = (
+                    f"layernum[{layernum}]_bsz{micro_bsz}_seq{seq_len}"
+                    f"_mlp_rank0_act"
+                )
+                if attn_key in entries and mlp_key in entries:
+                    attn_acts.append(float(entries[attn_key]))
+                    mlp_acts.append(float(entries[mlp_key]))
+        if not attn_acts or not mlp_acts:
+            return None
+        attn_avg = sum(attn_acts) / len(attn_acts)
+        mlp_avg = sum(mlp_acts) / len(mlp_acts)
+        if attn_avg <= 0 or mlp_avg <= 0:
+            return None
+        total = attn_avg + mlp_avg
+        return attn_avg / total, mlp_avg / total
+
+    def per_layer_act_alpha_beta(
+        self, *, unit: Literal["attention", "mlp"],
+        tp: int, ep: int, micro_bsz: int, seq_len: int,
+        recompute: bool = False, sequence_parallel: bool = True,
+    ) -> Optional[Tuple[float, float]]:
+        """OLS ``(α, β)`` for the per-layer activation MB of one
+        component (``unit="attention"`` or ``"mlp"``) at the profiled
+        ``micro_bsz``.
+
+        Returns ``None`` when the three-pass profile hasn't been run
+        at this shape (or under the requested recompute mode).
+        """
+        raw_path = self._raw_memory_path(tp, ep)
+        if not os.path.isfile(raw_path):
+            return None
+        raw = self._load_json(raw_path)
+        sp_marker = "_sp" if sequence_parallel else ""
+        cpt_marker = "_c" if recompute else ""
+        samples_by_n: Dict[int, List[float]] = {}
+        for strategy_key, entries in raw.items():
+            if not strategy_key.startswith("1_"):
+                continue
+            base = (
+                strategy_key[:-3]
+                if strategy_key.endswith("_sp") else strategy_key
+            )
+            ends_cpt = base.endswith("_c")
+            if cpt_marker and not ends_cpt:
+                continue
+            if not cpt_marker and ends_cpt:
+                continue
+            ends_sp = strategy_key.endswith("_sp")
+            if (sp_marker and not ends_sp) or (not sp_marker and ends_sp):
+                continue
+            expected_tail = (
+                f"_bsz{micro_bsz}_seq{seq_len}_{unit}_rank0_act"
+            )
+            for key, value in entries.items():
+                if not key.startswith("layernum["):
+                    continue
+                if not key.endswith(expected_tail):
+                    continue
+                try:
+                    n = int(key[len("layernum["):key.index("]")])
+                except ValueError:
+                    continue
+                samples_by_n.setdefault(n, []).append(float(value))
+        if not samples_by_n:
+            return None
+        averaged = sorted(
+            (float(n), sum(vals) / len(vals))
+            for n, vals in samples_by_n.items()
+        )
+        if len(averaged) >= 2:
+            mean_n = sum(n for n, _ in averaged) / len(averaged)
+            mean_y = sum(y for _, y in averaged) / len(averaged)
+            cov = sum((n - mean_n) * (y - mean_y) for n, y in averaged)
+            var = sum((n - mean_n) ** 2 for n, _ in averaged)
+            if var <= 0:
+                return None
+            beta = cov / var
+            alpha = mean_y - beta * mean_n
+        else:
+            n, y = averaged[0]
+            if n <= 0:
+                return None
+            alpha, beta = 0.0, y / n
+        if beta <= 0:
+            return None
+        return alpha, beta
+
+    def _raw_memory_path(self, tp: int, ep: int) -> str:
+        """Path to the raw per-(tp, ep) memory profile JSON written by
+        ``utils.save_profiled_memory``."""
+        suffix = "" if (tp == 1 and ep == 1) else f"_tp{tp}_ep{ep}"
+        return os.path.join(
+            self.configs_dir,
+            f"memory_profiling_{self.mixed_precision}_{self.model_name}"
+            f"_seqlen{self.meta.get('max_position_embeddings', 4096)}"
+            f"{suffix}.json",
+        )

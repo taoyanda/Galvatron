@@ -47,14 +47,19 @@ class PPCostModel(ICostModel):
     The ``use_measured_memory_profile`` flag selects between two
     intra-stage variants when ``intra`` is auto-constructed:
 
-      * ``True`` (default, backward-compatible): instantiate
-        :class:`IntraCostModelMeasuredAct`, which sources per-layer
-        activation memory from ``profile_memory.sh``'s output (Step 4).
-      * ``False``: instantiate :class:`IntraCostModel` directly, which
-        will (after step 2b lands) source per-microbatch activation
-        from ``chunks_overhead_profile`` (Step 8b) and analytical
-        formulas — making Step 4 optional. Pre-2b, this is identical
-        to ``True``.
+      * ``False`` (default): instantiate :class:`IntraCostModel`
+        directly. Per-layer params + embed/lm-head come from analytical
+        formulas (model dimensions in ``meta``); per-component
+        activation slope comes from ``chunks_overhead_profile`` (Step 8b
+        per-component data) when available, with closed-form
+        boundary-tensor fallback. Step 4 (``profile_memory.sh``) is not
+        required for this path.
+      * ``True``: instantiate :class:`IntraCostModelMeasuredAct`, which
+        sources per-layer activation memory from Step 4's
+        ``memory_profile`` JSON. Use this for parity comparisons or
+        when working with environments that still have Step 4 data on
+        disk. Raises ``FileNotFoundError`` at construction time if no
+        ``memory_profiling_*.json`` is present.
 
     The flag is ignored if ``intra`` is provided directly (the caller
     has already chosen the variant).
@@ -64,7 +69,7 @@ class PPCostModel(ICostModel):
         self,
         model_name: Optional[str] = None,
         intra: Optional[IntraCostModel] = None,
-        use_measured_memory_profile: bool = True,
+        use_measured_memory_profile: bool = False,
         **intra_kwargs: Any,
     ):
         if intra is None:
@@ -225,28 +230,41 @@ class PPCostModel(ICostModel):
         num_gpus_per_stage = dp * tp * ep
 
         # ---------- Whole-pipeline runtime-profile shortcut ----------
-        # When the runtime profile has an entry keyed by the per-stage
-        # shape × this pp, with an α/β fit across num_layers, use the fit
-        # to compute totals at the requested ``num_layers``. This captures
-        # PP send/recv comm + bubble overhead + per-rank framework memory
-        # under 1F1B that the per-stage compositional model misses.
-        # Skipped under asymmetric queries: the calibration was 1:1, so
-        # extrapolating the whole-iter ms by num_layers can't tell us
-        # what would happen with extra/fewer expert layers. We route
-        # through the per-stage composition instead.
-        # Shape key: (tp, ep, micro_bsz, seq_len, fsep[, pp]). ``micro_bsz``
-        # is the per-PP-stage compute batch size, matching the cost model's
-        # ``micro_batch_size`` argument (= trainer's
-        # global_train_batch_size at chunks=1 calibration). DP and EP are
-        # feasibility guards only (DP*EP ≤ micro_bsz), not key dimensions.
-        pp_key = (
-            f"tp{tp}_ep{ep}_micro_bsz{micro_batch_size}_seq{seq_len}"
-            f"_fsep{'on' if fsep else 'off'}" + ("" if pp == 1 else f"_pp{pp}")
-        )
-        runtime_pp_entry = None
-        if not asymmetric and self.runtime_profile is not None:
-            runtime_pp_entry = self.runtime_profile.get("by_shape", {}).get(pp_key)
+        # Shape key: ``tp{T}_ep{E}_micro_bsz{M}_seq{S}_fsep{ON|OFF}
+        # [_pp{P}][_w{W}]`` — pp omitted when 1, world omitted when 4.
+        # At pp > 1 we prefer the matching-world entry (PP=1 at
+        # world=num_gpus/pp): same per-rank compute as a PP=k stage
+        # but in saturation regime. Falls back to same-world entry,
+        # then to per-stage compositional path.
+        # Skipped for asymmetric queries (1:1 calibration only).
+        DEFAULT_WORLD = 4
+
+        def _shape_key(pp_eff: int, world_eff: int) -> str:
+            key = (f"tp{tp}_ep{ep}_micro_bsz{micro_batch_size}"
+                   f"_seq{seq_len}_fsep{'on' if fsep else 'off'}")
+            if pp_eff != 1:
+                key += f"_pp{pp_eff}"
+            if world_eff != DEFAULT_WORLD:
+                key += f"_w{world_eff}"
+            return key
+
+        def _entry(key: str) -> Optional[Dict]:
+            if asymmetric or self.runtime_profile is None:
+                return None
+            return self.runtime_profile.get("by_shape", {}).get(key)
+
+        pp_key = _shape_key(pp, num_gpus)
+        runtime_pp_entry = _entry(pp_key)
+
+        time_entry, time_source = runtime_pp_entry, pp_key
+        if pp > 1:
+            matching_key = _shape_key(1, num_gpus // pp)
+            matching_entry = _entry(matching_key)
+            if matching_entry and matching_entry.get("alpha_beta_fit"):
+                time_entry, time_source = matching_entry, matching_key
+
         alpha_beta_fits = (runtime_pp_entry or {}).get("alpha_beta_fit") or {}
+        time_alpha_beta_fits = (time_entry or {}).get("alpha_beta_fit") or {}
         # Two-tier lookup: if the requested ``num_layers`` matches one of
         # the profiled samples exactly, use the sample directly (avoids
         # the OLS noise of fitting potentially non-linear data — iter_ms
@@ -276,6 +294,86 @@ class PPCostModel(ICostModel):
         params_mb_resolved = _resolve("params_mb")
         optim_mb_resolved = _resolve("optimizer_mb")
         activation_mb_resolved = _resolve("activation_peak_mb")
+
+        # When predicting PP > 1 with matching-world calibration
+        # available, override the time AND memory fields from the
+        # matching-world α/β fits.
+        #
+        # Time override: α + β·N from ``fwd_bwd_ms`` and ``opt_ms``.
+        # ``matching_world_alpha_beta`` also signals that the downstream
+        # max_stage_compute formula should use α-on-last-stage
+        # (``α + β·(N/pp)``) instead of the legacy ``sum/pp`` divisor.
+        # Validation (validate_unseen_drift.py): PP=2 nl=12 drift drops
+        # from +13% to ±4% across chunks ∈ {1, 2, 4}.
+        #
+        # Memory override: per-stage memory state (params, optimizer,
+        # activation, cuda_peak) at PP=k 4-GPU stage equals
+        # ``α/pp + β·(N/pp)`` where α and β come from PP=1 at world=4/pp
+        # measurements. The α/pp split assumes embedding params (on
+        # stage 0) equals lm-head params (on stage pp-1), which holds
+        # exactly at vocab×hidden for our model. Validated within 1-2%
+        # against direct PP=2 4-GPU measurement.
+        matching_world_alpha_beta = None
+        if pp > 1 and time_entry is not None and time_entry is not runtime_pp_entry:
+            fb_fit = time_alpha_beta_fits.get("fwd_bwd_ms")
+            opt_fit_match = time_alpha_beta_fits.get("opt_ms")
+            if fb_fit and opt_fit_match:
+                matching_world_alpha_beta = (fb_fit, opt_fit_match)
+                sum_stage_at_N = fb_fit["alpha"] + fb_fit["beta"] * num_layers
+                # Per-stage opt time: matching-world opt is for a PP=1
+                # rank holding all N layers' optimizer state. At PP=k
+                # each rank holds ~1/pp of that state (transformer
+                # blocks split across stages; emb/lm-head per stage
+                # adds back ~half of α-on-each-end roughly cancelled by
+                # the loss). Divide by pp to get the per-rank wall-clock
+                # opt time at PP>1.
+                opt_at_N = (
+                    opt_fit_match["alpha"] + opt_fit_match["beta"] * num_layers
+                ) / pp
+                iter_ms_resolved = sum_stage_at_N + opt_at_N
+                opt_ms_resolved = opt_at_N
+
+                # Memory override:
+                #   - params_mb / optimizer_mb: α/pp + β·(N/pp). α here
+                #     captures emb+lm-head footprint, which truly splits
+                #     across stages (emb on stage 0, lm-head on stage k-1,
+                #     equal param counts at vocab×hidden).
+                #   - cuda_peak_mb / activation_peak_mb: α + β·(N/pp).
+                #     α here is dominated by per-rank framework constants
+                #     (FSDP all-gather workspace, expandable-segments
+                #     slack, dispatcher buffers) that do NOT shrink with
+                #     PP — every PP stage retains the full framework
+                #     footprint. Splitting α/pp under-predicts cuda_peak
+                #     by ~half of α at PP=2, which produced the OOM at
+                #     gbsz=128 nl=24 PP=2 tp=2 ep=1 (predicted 49 GB,
+                #     measured 77 GB → trainer OOM).
+                # Falls back to same-world if a field isn't in the
+                # matching-world fit.
+                _SPLIT_ALPHA = {"params_mb", "optimizer_mb"}
+
+                def _matching_world_memory(field: str) -> Optional[float]:
+                    fit = time_alpha_beta_fits.get(field)
+                    if not fit:
+                        return None
+                    alpha_term = fit["alpha"] / pp if field in _SPLIT_ALPHA else fit["alpha"]
+                    return alpha_term + fit["beta"] * (num_layers / pp)
+
+                for field, var_set in [
+                    ("cuda_peak_mb", "peak"),
+                    ("params_mb", "params"),
+                    ("optimizer_mb", "optim"),
+                    ("activation_peak_mb", "activation"),
+                ]:
+                    val = _matching_world_memory(field)
+                    if val is not None:
+                        if var_set == "peak":
+                            peak_mb_resolved = val
+                        elif var_set == "params":
+                            params_mb_resolved = val
+                        elif var_set == "optim":
+                            optim_mb_resolved = val
+                        elif var_set == "activation":
+                            activation_mb_resolved = val
 
         if (
             iter_ms_resolved is not None
@@ -320,18 +418,58 @@ class PPCostModel(ICostModel):
             # num_mb > 1.
             opt_ms_for_scaling = (opt_ms_resolved
                                   if opt_ms_resolved is not None else 0.0)
-            sum_stage_compute_ms_cal = max(
+            # Analytical 1F1B critical-path formula:
+            #
+            #   pipeline_iter_ms = sum_stage_compute
+            #                    + max_stage_compute × (num_microbatches − 1)
+            #                    + optimizer_step_time
+            #
+            # ``sum_stage_compute`` = total fwd+bwd through ALL stages
+            # for one microbatch (= ``fwd_bwd_ms`` at chunks=1 under
+            # the calibration recipe, recovered here as
+            # ``iter_ms_resolved − opt_ms_for_scaling``).
+            # ``max_stage_compute`` = slowest stage's compute time
+            # (uniform-layout approximation: sum_stage / pp).
+            #
+            # Empirically tested at nl ∈ {8, 12} PP ∈ {1, 2} chunks ∈
+            # {1, 2, 4}: this aggregated slope-only path keeps drift
+            # within ±13% across all axes (max |·| = 9.5% at nl=8,
+            # 13.3% at nl=12). Per-component slope-only sourced from
+            # ``unit_breakdown`` was tried and reverted because it
+            # over-predicts at PP > 1 — canonical nl=4 calibration is
+            # in the under-saturated regime at PP=2, while the
+            # aggregated {nl=2, nl=4} slope is closer to the saturated
+            # asymptote.
+            sum_stage_compute_ms = max(
                 0.0, iter_ms_resolved - opt_ms_for_scaling
             )
-            stage_bottleneck_ms = sum_stage_compute_ms_cal / max(1, pp)
-            # Empirical per-microbatch slope from the chunks=1 vs chunks=2
-            # calibration pair, when available for this shape + dp_mode.
-            # Bundles the analytical bottleneck term (which the Alpa
-            # formula gets right at chunks=1) with the per-microbatch
-            # overhead the analytical path misses (sync grad reduce, PP
-            # send/recv, scheduler — see Phase 0f). Validation at
-            # chunks=32 closed the gap from +34% to ~−2%.
-            chunks_slope_ms: Optional[float] = None
+            if matching_world_alpha_beta is not None:
+                # Matching-world calibration: max_stage = α + β·(N/pp).
+                # Attributes the per-iter overhead α (embedding fwd+bwd
+                # + lm-head fwd+bwd + dataloader/bookkeeping) entirely
+                # to the last stage — lm-head's hidden×vocab matmul
+                # dominates over the embedding gather, and the last
+                # stage's max_stage_compute is what gates the chunks
+                # scaling under 1F1B. β·(N/pp) is the per-stage
+                # transformer-block portion (uniform layout).
+                fb_fit, _ = matching_world_alpha_beta
+                stage_bottleneck_ms = (
+                    fb_fit["alpha"] + fb_fit["beta"] * (num_layers / pp)
+                )
+            else:
+                # Same-world calibration fallback: assume balanced
+                # per-stage compute (sum / pp).
+                stage_bottleneck_ms = sum_stage_compute_ms / max(1, pp)
+            pipeline_iter_ms = (
+                sum_stage_compute_ms
+                + stage_bottleneck_ms * max(0, num_microbatches - 1)
+                + opt_ms_for_scaling
+            )
+            # Diagnostic-only: still surface the chunks_overhead slope
+            # alongside the analytical prediction so cost_model_drift /
+            # cost_model_pp_drift can compare. The chunks_overhead
+            # profile remains useful for validating that the analytical
+            # formula matches measured chunks=2 behavior at calibration N.
             chunks_slope_source = ""
             if self.intra.chunks_overhead_profile is not None:
                 cs_entry = (
@@ -347,31 +485,11 @@ class PPCostModel(ICostModel):
                     if cs_block is not None and cs_block.get(
                         "time_per_extra_microbatch_ms"
                     ) is not None:
-                        chunks_slope_ms = float(
-                            cs_block["time_per_extra_microbatch_ms"]
-                        )
                         chunks_slope_source = (
-                            f"chunks_overhead[{pp_key}/"
+                            f"chunks_overhead_observed["
+                            f"{pp_key}/"
                             f"{cs_dp_mode if cs_dp_mode in per_dp else 'fallback'}]"
                         )
-
-            if chunks_slope_ms is not None:
-                # Use the empirical slope directly (it already includes
-                # bottleneck × 1 plus the per-microbatch overhead Alpa
-                # misses).
-                pipeline_iter_ms = (
-                    iter_ms_resolved
-                    + chunks_slope_ms * max(0, num_microbatches - 1)
-                )
-            else:
-                # Fall back to the Alpa analytical path: bottleneck
-                # recovered by assuming a uniform layout (the only layout
-                # the calibration matrix covers).
-                pipeline_iter_ms = (
-                    stage_bottleneck_ms * max(0, num_microbatches - 1)
-                    + sum_stage_compute_ms_cal
-                    + opt_ms_for_scaling
-                )
 
             # Two activation-reserve contributions on top of the
             # calibrated peak:
@@ -453,8 +571,10 @@ class PPCostModel(ICostModel):
                     "natural_n_behind": int(natural_n_behind),
                     "num_stages_behind_extra_mb": extra_reserve_mb,
                     "time_source": (
-                        f"runtime_profile[{pp_key}]+{resolution_mode}"
+                        f"runtime_profile[{time_source}]+{resolution_mode}"
                         f"(N_pts={num_data_points})"
+                        + ("+matching_world+α-on-last-stage"
+                           if matching_world_alpha_beta is not None else "")
                         + (f"+{chunks_slope_source}" if chunks_slope_source else "")
                     ),
                     "memory_source": memory_source,

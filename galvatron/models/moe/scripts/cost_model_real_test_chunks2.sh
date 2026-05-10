@@ -18,34 +18,33 @@
 # replaces the legacy Step 4 ``profile_memory.sh`` per-component data
 # (which was unreliable: byte-identical across (tp, ep) variants).
 #
-# The matrix below mirrors the main matrix's currently-active rows
-# (FSEP-on at gbsz ∈ {4, 2}, FSEP-off at gbsz=1). Profile-unit fan-out
-# matches the main sweep ("all attention mlp") so per-component
-# chunks=1/2 pairs land in the aggregator. ~12 base configs × 3 units
-# = ~36 inner runs at ~100 s each ≈ 60-70 minutes.
+# The matrix below mirrors the main matrix's PP=1 rows post-multi-world
+# refactor (PP=2 calibration is opt-in via cost_model_real_test_pp2.sh).
+# Profile-unit fan-out follows the main script's default (``all`` only,
+# unless overridden via DEFAULT_PROFILE_UNITS for the asymmetric path).
+# 13 base configs × 1 unit (default) = 13 inner runs at ~80-100 s each
+# ≈ 18-22 minutes for world=4. The world=2 / world=1 chunks=2 sisters
+# (cost_model_real_test_chunks2_w2.sh / _w1.sh) cover those worlds.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN_SCRIPT="${SCRIPT_DIR}/cost_model_real_test.sh"
 
-# (pp tp ep dp_mode micro_bsz fsep) — mirror the main matrix's active
-# rows. The main matrix is FSEP-on at gbsz ∈ {4, 2} and FSEP-off at
-# gbsz=1 (FSEP-on is infeasible at micro_bsz=1 — pp×tp must equal
-# world=4 for per-rank ≥ 1, but FSEP-on requires pp×tp < world).
-# profile_unit fan-out (all/attention/mlp) is delegated to
-# cost_model_real_test.sh.
+# (pp tp ep dp_mode micro_bsz fsep) — mirror the main world=4 PP=1 matrix.
+# Feasibility on world=4: dp×tp ≤ world AND tp×ep ≤ world (the FSDP+TP
+# and TP×EP grids each fit). Plus the trainer's
+# ``gbsz % (world/(pp×min(tp×ep, vocab_tp))) == 0`` assertion confines
+# tp=1 entries to gbsz=4. (1,2,2) at gbsz=2 trips relocate_activations
+# empirically, so it's excluded.
 GBSZ_BASE=$'1 1 1 zero2sdp 4 on
 1 1 2 zero2sdp 4 on
 1 1 4 zero2sdp 4 on
 1 2 1 zero2sdp 4 on
 1 2 2 zero2sdp 4 on
-2 1 1 zero2sdp 4 on
-2 1 2 zero2sdp 4 on
+1 4 1 zero2sdp 4 off
 1 2 1 zero2sdp 2 on
-2 1 2 zero2sdp 2 on
-2 1 1 zero2sdp 2 on
-1 4 1 zero2sdp 1 off
-2 2 1 zero2sdp 1 off'
+1 4 1 zero2sdp 2 off
+1 4 1 zero2sdp 1 off'
 
 export CONFIGS_BASE_OVERRIDE="${GBSZ_BASE}"
 export CHUNKS=2
