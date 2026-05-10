@@ -231,7 +231,7 @@ def galvatron_training_args(parser, use_megatron=True):
     group.add_argument(
         "--moe_computation_config_path",
         type=str,
-        default="./configs/computation_profiling_bf16_mixtral-8x7b.json",
+        default="./configs/computation_profiling_bf16_qwen-30b-a3b-e128k8_seqlen4096.json",
         help="Path to LAER solver computation-cost config. Previously read via getattr in "
         "smart_routing.py without CLI registration.",
     )
@@ -240,5 +240,19 @@ def galvatron_training_args(parser, use_megatron=True):
         type=str,
         default="./configs/network_config.json",
         help="Path to LAER solver network-bandwidth config.",
+    )
+    group.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress cost-model-validation diagnostic prints in "
+            "train_dist_frozen.py: [real_measure], [mem_evo], "
+            "[stage_time], [fsep_verify], [static_input]. Loss / "
+            "framework prints stay. Useful when running the "
+            "frozen-input trainer with --galvatron_config_path for a "
+            "quiet end-to-end run rather than a calibration sweep. "
+            "[stackdump] (SIGUSR1 handler) is intentionally NOT gated "
+            "— it's an explicit operator-triggered debug dump."
+        ),
     )
     return parser

@@ -38,7 +38,7 @@ class MoEOptimizer:
         
     def _extract_computation_speed(self) -> float:
         """Extract computation speed from config"""
-        base_key = "layertype_0_bsz1_seq4096_mlp"
+        base_key = "layertype_0_bsz2_seq4096_mlp"
         if base_key in self.computation_config:
             return self.computation_config[base_key] / 4096  # ms/token
         return 0.001  # default: 1ms per token

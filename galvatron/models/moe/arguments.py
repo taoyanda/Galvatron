@@ -90,6 +90,10 @@ def model_args(parser):
         action="store_true",
         help="Set aux loss manually",
     )
+    # --quiet moved to galvatron_training_args in
+    # galvatron/core/runtime/arguments.py so all model entry points
+    # (not just MoE) can suppress trainer-side diagnostic prints
+    # under --galvatron_config_path runs.
     return parser
 
 

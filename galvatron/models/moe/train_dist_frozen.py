@@ -34,6 +34,19 @@ from megatron.training.arguments import _print_args
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
 
+def _diag(args, msg):
+    """Emit a cost-model-validation diagnostic line gated on ``--quiet``.
+
+    Used for the [real_measure] / [mem_evo] / [stage_time] / [fsep_verify]
+    / [static_input] / [stackdump] prints that are useful for calibration
+    sweeps but pure noise for end-to-end training under
+    ``--galvatron_config_path`` (where the operator just wants a clean
+    train run with frozen input).
+    """
+    if not getattr(args, "quiet", False):
+        print(msg, flush=True)
+
+
 def _maybe_load_deterministic_batch(args, fallback_batch, device):
     """Load ``static_inputs/{model_size}_bs{N}_{precision}.pt`` if present.
 
@@ -56,10 +69,10 @@ def _maybe_load_deterministic_batch(args, fallback_batch, device):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     if not os.path.isfile(path):
         if rank == 0:
-            print(
+            _diag(
+                args,
                 f"[static_input] deterministic file not found at {path}, "
                 f"falling back to dataloader random batch (bsz={per_rank_bsz})",
-                flush=True,
             )
         return fallback_batch
     loaded = torch.load(path, map_location="cpu")
@@ -76,11 +89,11 @@ def _maybe_load_deterministic_batch(args, fallback_batch, device):
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
     if rank == 0:
-        print(
+        _diag(
+            args,
             f"[static_input] loaded deterministic batch from {path} "
             f"tokens.shape={tuple(tokens.shape)} sum={tokens.sum().item()} "
             f"first8={tokens.flatten()[:8].tolist()}",
-            flush=True,
         )
     return (
         tokens,
@@ -281,10 +294,8 @@ def train(args):
     # 2 fp32 momentums (Adam m, v) + bf16 grad ≈ 10 bytes/param.
     _rm_optimizer_mb_pred = _rm_n_params * (4 + 4 + 2) / 1e6
     if rank == 0:
-        print(f"[real_measure] params_mb={_rm_params_mb:.2f}", flush=True)
-        print(
-            f"[real_measure] optimizer_mb_pred={_rm_optimizer_mb_pred:.2f}", flush=True
-        )
+        _diag(args, f"[real_measure] params_mb={_rm_params_mb:.2f}")
+        _diag(args, f"[real_measure] optimizer_mb_pred={_rm_optimizer_mb_pred:.2f}")
     _rm_act_logged = False
 
     path = os.path.dirname(os.path.abspath(__file__))
@@ -299,7 +310,7 @@ def train(args):
     # [solver_init] / [solver_submit] / [layer N layout frozen]
     # prints emitted from MoEAlltoAllSmartTokenDispatcher.
     # ============================================================
-    if rank == 0:
+    if rank == 0 and not getattr(args, "quiet", False):
         use_fsep = bool(getattr(args, "use_fsep", False))
         solver_enabled = os.environ.get("ENABLE_SOLVER", "0") == "1"
         freeze_iter = int(getattr(args, "laer_freeze_after_iter", -1))
@@ -351,9 +362,9 @@ def train(args):
     _mem_logged = False
     _stage_logged = False
     if rank == 0:
-        print(
+        _diag(
+            args,
             f"[mem_evo] post_construct_mb={torch.cuda.max_memory_allocated()/1e6:.2f}",
-            flush=True,
         )
 
     static_input = getattr(args, "static_input", False)
@@ -364,12 +375,12 @@ def train(args):
     # the gate params (paying their m/v memory + compute cost).
     router_gate_params = _collect_router_gate_params(model) if static_input else []
     if static_input and rank == 0:
-        print(
+        _diag(
+            args,
             f"[static_input] freezing {len(router_gate_params)} router-gate "
             f"param(s) to keep dispatch bit-identical across iters; "
             f"optimizer.step() still iterates over them so timing/memory are "
             f"unaffected.",
-            flush=True,
         )
     for ep in range(args.epochs):
         if not args.check_loss and not args.profile:
@@ -403,9 +414,9 @@ def train(args):
             if rank == 0 and iter == _MEM_ITER and not _mem_logged:
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
-                print(
+                _diag(
+                    args,
                     f"[mem_evo] pre_fwd_mb={torch.cuda.max_memory_allocated()/1e6:.2f}",
-                    flush=True,
                 )
 
             _fb_s = torch.cuda.Event(enable_timing=True) if rank == 0 else None
@@ -421,9 +432,9 @@ def train(args):
             profiler.profile_memory(iter, "After Backward")
             if rank == 0 and iter == _MEM_ITER and not _mem_logged:
                 torch.cuda.synchronize()
-                print(
+                _diag(
+                    args,
                     f"[mem_evo] post_fwd_bwd_mb={torch.cuda.max_memory_allocated()/1e6:.2f}",
-                    flush=True,
                 )
 
             # Under --static_input, freeze router-gate weights so the router
@@ -446,9 +457,9 @@ def train(args):
             profiler.profile_memory(iter, "After optimizer_step")
             if rank == 0 and iter == _MEM_ITER and not _mem_logged:
                 torch.cuda.synchronize()
-                print(
+                _diag(
+                    args,
                     f"[mem_evo] post_opt_step_mb={torch.cuda.max_memory_allocated()/1e6:.2f}",
-                    flush=True,
                 )
 
             if rank == 0 and _fb_s is not None:
@@ -488,12 +499,12 @@ def train(args):
                 # prefer ``cuda_peak_mb`` directly; ``activation_peak_mb``
                 # remains for back-compat reporting.
                 _act_peak_mb = max(0.0, _peak_mb - _rm_params_mb - _opt_actual_mb)
-                print(
+                _diag(
+                    args,
                     f"[real_measure] optimizer_mb={_opt_actual_mb:.2f} "
                     f"activation_peak_mb={_act_peak_mb:.2f} "
                     f"cuda_peak_mb={_peak_mb:.2f} "
                     f"cuda_peak_reserved_mb={_peak_reserved_mb:.2f}",
-                    flush=True,
                 )
                 _rm_act_logged = True
 
@@ -501,9 +512,9 @@ def train(args):
 
             if rank == 0 and iter == _MEM_ITER and not _mem_logged:
                 torch.cuda.synchronize()
-                print(
+                _diag(
+                    args,
                     f"[mem_evo] post_zero_grad_mb={torch.cuda.max_memory_allocated()/1e6:.2f}",
-                    flush=True,
                 )
                 _mem_logged = True
 
@@ -519,11 +530,11 @@ def train(args):
                     _fb_win = _fb_samples[_s:_e]
                     _op_win = _opt_samples[_s:_e]
                     if _fb_win:
-                        print(
+                        _diag(
+                            args,
                             f"[stage_time] fwd_bwd_ms={sum(_fb_win)/len(_fb_win):.4f} "
                             f"opt_ms={sum(_op_win)/len(_op_win):.4f} "
                             f"window=[{_s},{_e})",
-                            flush=True,
                         )
                         _stage_logged = True
 
@@ -541,11 +552,11 @@ def train(args):
         fb = _fb_samples[s:e]
         op = _opt_samples[s:e]
         if fb:
-            print(
+            _diag(
+                args,
                 f"[stage_time] fwd_bwd_ms={sum(fb)/len(fb):.4f} "
                 f"opt_ms={sum(op)/len(op):.4f} "
                 f"window=[{s},{e})",
-                flush=True,
             )
 
 
