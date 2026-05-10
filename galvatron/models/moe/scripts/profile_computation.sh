@@ -91,8 +91,8 @@ PROFILE_ARGS="
     --profile_batch_size_step 1 \
     --profile_seq_length_list 4096 \
     --mlp_profile_mode prof_mlp \
-    --layernum_min 2 \
-    --layernum_max 4 \
+    --layernum_min 32 \
+    --layernum_max 128 \
     --mixed_precision bf16 \
     --use-flash-attn \
     --static_input \

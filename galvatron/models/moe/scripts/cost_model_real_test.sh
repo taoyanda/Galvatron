@@ -32,7 +32,7 @@ export NUM_NODES=${NUM_NODES:-1}
 export NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE:-4}
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-29500}
-export NODE_RANK=${RANK:-0}
+export NODE_RANK=${NODE_RANK:-0}
 
 export OMP_NUM_THREADS=8
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
@@ -71,6 +71,8 @@ unset _world _island SCRIPT_DIR_FOR_DETECT
 export TORCH_NCCL_AVOID_RECORD_STREAMS=${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export ENABLE_SOLVER=${ENABLE_SOLVER:-1}
+export NCCL_IB_DISABLE=0
+export NCCL_IB_HCA="mlx5_0"
 
 # NUM_LAYERS_LIST: space-separated layernums profiled per shape. Default
 # "2 4" gives the aggregator two N points to fit `iter_ms = α + β · N`
@@ -79,7 +81,7 @@ export ENABLE_SOLVER=${ENABLE_SOLVER:-1}
 # A3B). Set NUM_LAYERS_LIST="4" to revert to the legacy single-point
 # sweep. Single-value NUM_LAYERS env var is honored as a back-compat
 # alias when NUM_LAYERS_LIST is unset.
-NUM_LAYERS_LIST=${NUM_LAYERS_LIST:-${NUM_LAYERS:-"2 4"}}
+NUM_LAYERS_LIST=${NUM_LAYERS_LIST:-${NUM_LAYERS:-"2 4 8"}}
 SEQ_LEN=4096
 EPOCHS=20  # need ≥20 iters: profiler averages [10, 20), and we sample the
             # memory-evolution snapshot at iter 10.
@@ -265,7 +267,7 @@ LOG_DIR="${MODEL_DIR}/logs"
 STATIC_INPUT_PATH="${MODEL_DIR}/static_inputs/qwen-30b-a3b-e128k8_bs1_bf16.pt"
 mkdir -p "${LOG_DIR}"
 
-LAUNCHER="torchrun --nnodes ${NUM_NODES} --nproc_per_node ${NUM_GPUS_PER_NODE} --master_port ${MASTER_PORT}"
+LAUNCHER="torchrun --nnodes ${NUM_NODES} --nproc_per_node ${NUM_GPUS_PER_NODE} --node_rank ${NODE_RANK} --master_addr ${MASTER_ADDR} --master_port ${MASTER_PORT}"
 
 echo "[env] CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY:-<unset>}"
 echo "[env] NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL:-<unset>}"
@@ -388,9 +390,9 @@ for tuple in "${CONFIGS[@]}"; do
     # a command name (rc=127). See doc/cross_numa_nccl_postmortem.md.
     NCCL_ENV=()
     raw_dp=$(( NUM_GPUS_PER_NODE * NUM_NODES / (PP * TP) ))
-    if [ "${GALVATRON_P2P_ISLAND_SIZE:-0}" -gt 0 ] && [ "${raw_dp}" -gt "${GALVATRON_P2P_ISLAND_SIZE}" ]; then
-        NCCL_ENV=("NCCL_P2P_DISABLE=1")
-    fi
+    # if [ "${GALVATRON_P2P_ISLAND_SIZE:-0}" -gt 0 ] && [ "${raw_dp}" -gt "${GALVATRON_P2P_ISLAND_SIZE}" ]; then
+    #     NCCL_ENV=("NCCL_P2P_DISABLE=1")
+    # fi
 
     echo "========================================================"
     echo "  cost_model_real: pp=${PP} tp=${TP} ep=${EP} dp_mode=${DP_MODE} bsz=${GLOBAL_BSZ} chunks=${CHUNKS} fsep=${FSEP_MODE} unit=${PROFILE_UNIT} nl=${NUM_LAYERS} ${NCCL_ENV[*]:+(P2P_DISABLE)}"
