@@ -5,10 +5,13 @@ package, profile the model, calibrate the cost model, verify drift, run
 the search, validate. Target model is **Qwen3-30B-A3B** registered as
 `qwen-30b-a3b-e128k8` in `galvatron/models/moe/meta_configs/`.
 
-**Wall-clock estimate**: ~7 hours from blank instance to validated
-search output. Most of it is the calibration sweeps (~3 h main + ~25 min
-gap-fill + ~40 min chunks=2 + ~2 h FSEP-on per-block) plus a ~3 min
-end-to-end validation. Setup + drift checks are minutes.
+**Wall-clock estimate**: ~2.5 hours from blank instance to validated
+search output. Most of it is the calibration sweeps (~50 min Step 8a
+main + ~25 min Step 8b chunks=2) plus the per-component profiles
+(Steps 3–5, ~1.5 h combined) and a ~3 min end-to-end validation.
+Setup + drift checks are minutes. (Steps 6 and 7 — the legacy
+FSEP-on per-block compute / memory profiles — are excluded from
+the workflow; their data is captured by Step 8a's α + β × N fit.)
 
 **Skim time**: read top-to-bottom in 15 min before running anything.
 Each step has explicit expected outputs you should verify.
@@ -89,8 +92,11 @@ The cost model needs four layers of inputs to be accurate:
    feed the FSEP smart-routing solver and asymmetric attention/expert
    split for the analytical fall-back.
 2. **Per-block calibration anchors** (Step 8 main) — pin the absolute
-   time/memory at each `(tp, ep, micro_bsz, seq, fsep, pp)` shape;
-   α + β × N fit when ≥ 2 `num_layers` points exist.
+   time/memory at each `(tp, ep, micro_bsz, seq, fsep, pp)` shape; the
+   sweep runs at `NUM_LAYERS_LIST="2 4"` by default, so the aggregator
+   fits α + β × N per shape and the cost model can extrapolate to
+   production `num_layers=48`. Single-N sweeps cannot separate per-iter
+   bias (α) from per-layer cost (β).
 3. **FSEP overhead profile** (derived from on/off pairs in the same
    sweep) — captures FSEP-on dispatch cost per expert layer; used by
    the analytical fall-back for FSEP-on shapes without a calibration
@@ -110,8 +116,8 @@ drift instead of the ±2-5 % we see at fully-calibrated rows.
 | --- | --- |
 | `galvatron/models/moe/scripts/profile_computation.sh` | model dims for Qwen3 |
 | `galvatron/models/moe/scripts/profile_memory.sh` | model dims for Qwen3 |
-| `galvatron/models/moe/scripts/profile_computation_frozen.sh` | model dims, EP/cap tuples |
-| `galvatron/models/moe/scripts/profile_memory_frozen.sh` | same |
+| ~~`galvatron/models/moe/scripts/profile_computation_frozen.sh`~~ | ~~model dims, EP/cap tuples~~ — **moved to `_legacy/`**; not part of the workflow |
+| ~~`galvatron/models/moe/scripts/profile_memory_frozen.sh`~~ | ~~model dims, EP/cap tuples~~ — **moved to `_legacy/`**; cost model never read its `_fsep`-suffixed output |
 | `galvatron/models/moe/scripts/cost_model_real_test.sh` | `NUM_GLOBAL_EXPERTS`, model dims (`DEFAULT_CONFIGS_BASE` matrix is 4-GPU-shaped already) |
 | `galvatron/models/moe/scripts/profile_embedding_lmhead.py` | top-of-file `MODEL = ...` |
 | `galvatron/models/moe/scripts/profile_cost_model_terms.py` | `MODEL = ...`, `NUM_MOE_LAYERS = ...` |
@@ -314,92 +320,111 @@ sparse-scatter; much smaller.
 
 ---
 
-## 6. FSEP-on per-block computation profile (~2 hours, 4 GPUs)
+## 6. ~~FSEP-on per-block computation profile~~ — REMOVED FROM WORKFLOW
 
-This step was originally needed because the FSEP-on per-block compute
-profile differed from FSEP-off and the runtime profile (Step 8) didn't
-exist. With Step 8 now capturing per-component fwd+bwd at every shape
-including FSEP-on, **Step 6 is mostly subsumed** — the cost model
-prefers the runtime profile when present.
+Step 6 used to run `profile_computation_frozen.sh` to produce FSEP-on
+per-block fwd-only compute data. **It's been moved to
+`scripts/_legacy/`** because:
 
-Still useful when:
-- The FSEP smart-routing solver needs forward-only per-block timing
-  (it does — uses Step 3's three-pass for FSEP-off and Step 6's
-  single-pass for FSEP-on).
-- You're doing FSEP-on planning at shapes the calibration sweep didn't
-  cover.
+1. The runtime calibration sweep (Step 8) now captures FSEP-on full-iter
+   measurements at every (tp, ep, micro_bsz, fsep=on, pp) shape, with
+   an `α + β × N` fit covering layer-count extrapolation. The cost
+   model's PP shortcut path looks up runtime_profile directly.
+2. `fsep_overhead_profile` is built from FSEP-on/off pairs in
+   `runtime_profiling` — not from `computation_profiling_*_tp{T}_ep{E}.json`.
+3. `v_comp` (greedy balancer) and the FSEP smart-routing solver read
+   the FSEP-**off** computation profile (single-MLP per-token cost is
+   FSEP-invariant).
 
-If you skip Step 6, FSEP-on planning falls back to analytical
-extrapolation from Step 3's FSEP-off per-component data plus the FSEP
-overhead profile (Step 9).
-
-### 6.1 Edit `profile_computation_frozen.sh`
-
-(a) `MODEL_ARGS` — same Qwen3 substitution as Step 3.1.
-
-(b) `EP_CAP_TUPLES_DEFAULT`:
-```bash
-NUM_GPUS_PER_NODE=4
-
-# CAP = 128 / EP. On 4 GPUs viable EP ∈ {1, 2, 4}.
-EP_CAP_TUPLES_DEFAULT=(
-    "1 128"
-    "2 64"
-    "4 32"
-)
-```
-
-### 6.2 Run
-
-```bash
-docker exec hetu bash -lc \
-  "cd /root/Galvatron/galvatron/models/moe && bash scripts/profile_computation_frozen.sh"
-```
+The `_tp{T}_ep{E}`-suffixed compute-profile lookup path remains in
+`cost_model/intra.py` as a tertiary fall-back, so the legacy script
+can be re-run if the search ever queries shapes outside the
+calibration matrix. Otherwise: skip this step.
 
 ---
 
-## 7. FSEP-on memory profile (~30 min, 4 GPUs)
+## 7. ~~FSEP-on memory profile~~ — REMOVED FROM WORKFLOW
 
-```bash
-# Edit profile_memory_frozen.sh:
-#   - MODEL_ARGS: Qwen3 dims
-#   - EP_CAP_TUPLES: same as Step 6.1
-docker exec hetu bash -lc \
-  "cd /root/Galvatron/galvatron/models/moe && bash scripts/profile_memory_frozen.sh"
-```
+Step 7 used to run `profile_memory_frozen.sh` to produce FSEP-on per-(tp,
+ep) memory profiles (`memory_profiling_*_tp{T}_ep{E}_fsep.json`).
+**It's been moved to `scripts/_legacy/`** because:
 
-**Output**: `configs/memory_profiling_bf16_qwen-30b-a3b-e128k8_seqlen4096_tp*_ep*_fsep.json`
+1. The cost model has zero code paths that load `_fsep`-suffixed memory
+   JSONs. Both `memory_profile` lookup paths in `intra.py` (the main
+   loader at lines 85-102 and `_raw_memory_path` at 521-530) build
+   non-fsep filenames; grep for `_fsep.json` in `cost_model/` returns no
+   matches. The output of this script was produced but never read.
+2. The runtime calibration sweep (Step 8) captures FSEP-on `cuda_peak_mb`,
+   `params_mb`, `optimizer_mb`, `activation_peak_mb` at every shape with
+   `α + β × N` fitting, covering production num_layers extrapolation.
+3. `fsep_overhead_profile` (built from runtime FSEP on/off pairs in
+   Step 9) supplies the per-MoE-layer memory delta used by the
+   analytical fall-back in `intra.py:_fsep_memory_overhead_per_expert_layer_mb`.
 
-The `_fsep` suffix prevents collision with Step 4's FSEP-off memory
-profile.
+Pre-existing `_fsep`-suffixed JSONs in `configs/` are harmless — leave
+them in place or `git rm` separately.
 
 ---
 
-## 8. Calibration sweep (~3 h main + ~25 min gap-fill + ~40 min chunks=2)
+## 8. Calibration sweep (~50 min main + ~25 min chunks=2)
 
 This is what actually anchors the cost model's predictions on real
 measurements. Each per-config run produces one log in `logs/` with
 `[real_measure]`, `[stage_time]`, and `Average iteration time is:`
 lines that `profile_cost_model_terms.py` aggregates in Step 9.
 
-The sweep is split into three parts run sequentially:
+The sweep is split into two parts run sequentially:
 
-- **8a. Main matrix** (~3 h): the production calibration covering all
-  feasible `(pp, tp, ep, dp_mode, fsep)` tuples at micro_bsz=4 with
-  per-component fan-out (`profile_unit ∈ {all, attention, mlp}`).
-- **8b. Per-microbatch overhead** (~40 min): same matrix at chunks=2 to
-  derive `time_per_extra_microbatch_ms` slopes per shape.
-- **8c. Gap-fill** (~25 min): adds calibration at gbsz ∈ {1, 2} to
-  cover shapes the search needs at smaller per-rank micro_bsz.
+- **8a. Main matrix** (~50 min): the production calibration covering all
+  feasible `(pp, tp, ep, dp_mode, fsep)` tuples at micro_bsz ∈ {4, 2, 1}
+  with per-component fan-out (`profile_unit ∈ {all, attention, mlp}`).
+  Runs each shape at **two layernums** (`NUM_LAYERS_LIST="2 4"`) so the
+  aggregator can fit `α + β · N` per shape — used to extrapolate to
+  production `num_layers=48`. Without two N points, the cost model
+  falls back to scaling-by-N which assumes `α = 0` (all overhead is
+  per-layer, which it isn't — embedding/lm-head/PP-init costs are
+  per-iter). gbsz ∈ {4, 2, 1} are all native to the matrix so a single
+  sweep covers every shape the search will query (search enumerates
+  micro_bsz ∈ {1, 2, 4}).
+- **8b. Per-microbatch overhead** (~25 min): same matrix at chunks=2
+  with full `{all, attention, mlp}` profile-unit fan-out, to derive
+  both:
+  - `time_per_extra_microbatch_ms` slopes per shape (Alpa-formula
+    correction for forced-sync grad-reduce, PP send/recv churn,
+    scheduler overhead).
+  - **Per-component activation slopes** per shape (`attention_alloc_per_extra_microbatch_mb`
+    and `mlp_alloc_per_extra_microbatch_mb`): in 1F1B, activations stack
+    with chunks but grads accumulate in-place, so the chunks=2−chunks=1
+    cuda_peak delta on a `unit=attention` / `unit=mlp` model directly
+    measures per-microbatch activation memory of that component,
+    separated from grad-bucket and optimizer-state contributions. The
+    IntraCostModel consumes these for its 1F1B PP `extra_reserve_mb`
+    calculation under asymmetric-layer queries (Phase 1b of
+    asymmetric search plan).
+
+  Pinned to `NUM_LAYERS_LIST="2"` only — per-microbatch overhead and
+  per-microbatch activation are both layernum-invariant in expectation
+  (the chunks delta isolates the per-microbatch axis), and smaller nl
+  makes each inner config faster. The aggregator pairs chunks=1 ↔
+  chunks=2 within the same `num_layers`, so the chunks=1 anchor at
+  nl=2 from Step 8a is what's used.
 
 ### 8.1 Customize `cost_model_real_test.sh`
 
 (a) **Top-of-file constants** (already 4-GPU-shaped):
 ```bash
-NUM_NODES=1
-NUM_GPUS_PER_NODE=4
+NUM_NODES=${NUM_NODES:-1}
+NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE:-4}
 NUM_GLOBAL_EXPERTS=128
 ```
+Both `NUM_NODES` and `NUM_GPUS_PER_NODE` honor env-var overrides so a
+non-default world size can be requested ad-hoc (e.g.
+`NUM_GPUS_PER_NODE=2 bash scripts/cost_model_real_test.sh 1 1 2 zero2sdp 4 on all`
+to profile the matching shape that a PP=2 stage on 4 GPUs would see).
+Whenever `world ≠ 4`, the log filename is suffixed with `_w{world}`
+to avoid colliding with the default 4-GPU calibration log path —
+critical because `logs/` is a symlink to the untracked `profile_logs/`,
+so a same-name overwrite is unrecoverable from git.
 
 (b) **Model launch args** (in the trainer invocation): match Qwen3's
 hidden=2048, intermediate=768, num_local_experts=128, etc. The script
@@ -413,68 +438,136 @@ docker exec hetu bash -lc \
   "cd /root/Galvatron/galvatron/models/moe && bash scripts/generate_static_input.sh"
 ```
 
-(d) **Default matrix**: ships with zero2sdp-only entries (zero3 was
-dropped — empirically slower than zero2sdp at identical memory peaks
-on this matrix). 16 base configs × {all, attention, mlp} (with
-attention+fsep=on skipped) ≈ 80 runs.
+(d) **Default matrix**: ships with FSEP-on-only zero2sdp entries at
+gbsz ∈ {4, 2} (zero3 dropped — empirically slower at identical
+memory peaks; FSEP-off dropped per current iteration directive),
+plus two FSEP-off zero2sdp entries at gbsz=1 (FSEP-on is infeasible
+at micro_bsz=1 because it requires `pp*tp < world` while the only
+viable per-rank≥1 layouts have `pp*tp = world=4`). 12 base configs
+(7 at gbsz=4 + 3 at gbsz=2 + 2 at gbsz=1) × {all, attention, mlp}
+fan-out × {nl=2, nl=4} ≈ 72 runs. Attention is profiled on every
+shape (the historical ``attention+fsep=on`` skip orphaned attention
+entirely under FSEP-on-only matrices and was removed); the
+aggregator's ``unit_breakdown`` indexes attention fsep-agnostically,
+so the same measurement applies to both fsep on/off shape keys.
+
+The `(PP=1, TP=2, EP=2, gbsz=2)` row is excluded from gbsz=2
+(per_rank=1 + TP=2 + EP>1 trips Galvatron's `relocate_activations`
+batch-dim shard; `MoESearcher.score()` rejects the same shape
+upfront, so calibration here would be unused).
 
 (e) **NCCL P2P workaround**: the script auto-detects island size via
 `detect_p2p_island_size.py` and prepends `NCCL_P2P_DISABLE=1` for
 collectives that span both islands. No manual config needed.
 
-### 8a. Main calibration sweep
+(f) **Aggregator nl handling** (`profile_cost_model_terms.py`):
+- `runtime_profile`: keeps **both** N samples per shape and fits
+  `α + β · N` per (params_mb, optimizer_mb, activation_peak_mb,
+  cuda_peak_mb, fwd_bwd_ms, opt_ms, iter_ms). Cost model picks the
+  exact-N sample first; falls back to the fit when the queried N
+  isn't in the calibration set (e.g., production N=48).
+- `fsep_overhead_profile`: pairs FSEP-on/off **within** the same N,
+  then averages per-layer overhead across N pairs. Multi-N gives 2×
+  more pair samples per shape → more robust slope.
+- `chunks_overhead_profile`: pairs chunks=1/chunks=2 within the same
+  N. Step 8b is pinned to nl=2 only, so the pairing matches the
+  nl=2 chunks=1 anchor produced by Step 8a.
+- `unit_breakdown` (per-component attention vs MLP split): **pinned
+  to a single canonical N per aggregator run** (DEFAULT=4, else max
+  N present). The cost model derives per-layer cost via
+  `attention_fwd_bwd_ms / unit_num_layers`, which expects one N per
+  shape; mixing N values silently halves per-layer cost. The
+  aggregator prints `# unit_breakdown: multiple num_layers present
+  [...], pinning to nl=4` when it filters. The nl=2 unit_breakdown
+  measurements are discarded — α + β fitting per component is
+  future work (see `doc/asymmetric_search_plan.md` Phase 1b).
 
+### 8a. Main calibration sweep — multi-world PP=1 matrix
+
+Multi-world PP=1 calibration now replaces direct PP=k measurement: for
+PP > 1 prediction, the cost model looks up the matching shrunk-world
+calibration (a PP=k stage on a 4-GPU box has the same per-rank compute
+as a PP=1 run on a 4/k-GPU world with the same `(tp, ep, mbsz)`).
+This captures the saturation regime that direct PP=k calibration at
+small `num_layers/stage` misses; validation drops PP=2 nl=12 drift
+from +13 % to ±4 %.
+
+Run the three world sizes in sequence:
 ```bash
 docker exec hetu bash -lc \
-  "cd /root/Galvatron && bash galvatron/models/moe/scripts/cost_model_real_test.sh \
-   > /tmp/step8_sweep.log 2>&1" &
-
-# Monitor:
-docker exec hetu grep -c '\[cost_model_real\].*OK' /tmp/step8_sweep.log
+  "cd /root/Galvatron && \
+   bash galvatron/models/moe/scripts/cost_model_real_test.sh    > /tmp/step8a_w4.log 2>&1 && \
+   bash galvatron/models/moe/scripts/cost_model_real_test_w2.sh > /tmp/step8a_w2.log 2>&1 && \
+   bash galvatron/models/moe/scripts/cost_model_real_test_w1.sh > /tmp/step8a_w1.log 2>&1"
 ```
 
-Expected: ~80 OK / 0 FAILED, ~3 hours.
+Expected counts (default `DEFAULT_PROFILE_UNITS="all"`):
+- `cost_model_real_test.sh` (world=4): **9 base × 2 nl = 18 runs, ~7 min**
+- `cost_model_real_test_w2.sh` (world=2): **7 base × 2 nl = 14 runs, ~5 min**
+- `cost_model_real_test_w1.sh` (world=1): **3 base × 2 nl = 6 runs, ~2 min**
+
+Set `DEFAULT_PROFILE_UNITS="all attention mlp"` to enable the per-
+component fan-out (×3 runs) — required only for the asymmetric search
+path.
+
+The legacy PP=2 calibration entries are now opt-in via
+`cost_model_real_test_pp2.sh` (preserves the historical data path for
+cross-checks; not part of the minimum-working profiling).
+
+Logs from world ≠ 4 land with the `_w{world}` filename suffix to keep
+them disjoint from the 4-GPU baselines (`logs/` is a symlink to the
+untracked `profile_logs/`, so accidental overwrites are unrecoverable
+from git — see `feedback_logs_symlink_trap` memory).
 
 ### 8b. Per-microbatch overhead calibration (chunks=2)
 
+Three sister scripts mirror the multi-world chunks=1 matrix at
+`CHUNKS=2`:
 ```bash
 docker exec hetu bash -lc \
-  "cd /root/Galvatron && bash galvatron/models/moe/scripts/cost_model_real_test_chunks2.sh \
-   > /tmp/step8_chunks2.log 2>&1" &
+  "cd /root/Galvatron && \
+   bash galvatron/models/moe/scripts/cost_model_real_test_chunks2.sh    > /tmp/step8b_w4.log 2>&1 && \
+   bash galvatron/models/moe/scripts/cost_model_real_test_chunks2_w2.sh > /tmp/step8b_w2.log 2>&1 && \
+   bash galvatron/models/moe/scripts/cost_model_real_test_chunks2_w1.sh > /tmp/step8b_w1.log 2>&1"
 ```
 
-Expected: 16 OK / 0 FAILED, ~40 min. Runs the same shape matrix with
-`CHUNKS=2` (so `gbsz=8`, num_microbatches=2, per-rank workload
-unchanged) and `profile_unit=all` only.
+Expected: 9 + 7 + 3 = **19 runs at nl=2 each, ~7 min total**.
+`NUM_LAYERS_LIST="2"` is pinned at the smallest nl per
+`feedback_chunks_overhead_min_layernum` (chunks_overhead is layernum-
+invariant in expectation; smaller nl = faster). Pairs with the
+chunks=1 anchor at the same world from step 8a to derive the
+per-microbatch time and activation slopes.
 
-This step is essential for closing the iter_ms prediction gap at
-chunks > 1 (validation at chunks=32 drops the cost-model drift from
-+34 % to −2.3 % once the chunks=2 anchor is in place).
+This step is essential for two reasons:
 
-### 8c. Gap-fill at gbsz ∈ {1, 2}
-
-```bash
-docker exec hetu bash -lc \
-  "cd /root/Galvatron && bash galvatron/models/moe/scripts/cost_model_real_test_gap_fill.sh \
-   > /tmp/step8_gap_fill.log 2>&1" &
-```
-
-Expected: ~46 OK / ~10 expected FAILED, ~25 min. The 10 failures all
-land on `(PP=1, TP=2, EP=2, gbsz=2)` shapes with per_rank=1 + TP=2 +
-EP>1, which trip Galvatron's `relocate_activations` batch-dim shard
-assertion (see Troubleshooting). The cost-model search rejects those
-configs upfront so they're never queried.
+1. **iter_ms prediction at chunks > 1**: validation at chunks=32 drops
+   the cost-model drift from +34 % to −2.3 % once the per-shape
+   `time_per_extra_microbatch_ms` slope is in place.
+2. **Per-component activation memory** (attention vs MLP per
+   microbatch): in 1F1B activations stack with chunks but grads
+   accumulate in-place, so the chunks=2 − chunks=1 cuda_peak delta on
+   `unit=attention` / `unit=mlp` models directly measures
+   per-microbatch activation per component, separated from
+   grad-bucket / optimizer-state contributions. The IntraCostModel's
+   PP `extra_reserve_mb` calculation under asymmetric layer-split
+   queries reads `attention_alloc_per_extra_microbatch_mb` and
+   `mlp_alloc_per_extra_microbatch_mb` from
+   `chunks_overhead_profiling_*.json`. This replaces the legacy
+   Step 4 `profile_memory.sh` per-component data path (which had
+   reliability issues — values were byte-identical across (tp, ep)
+   variants under SP, violating physical expectation).
 
 ### 8.4 Verify the calibration logs
 
 ```bash
 ls galvatron/models/moe/logs/cost_model_real_*.log | wc -l
-# expected: ~80 (main) + 16 (chunks=2) + 56 (gap-fill) ≈ 150 logs
+# expected: 72 (Step 8a main: 12 × 3 × 2) + 36 (Step 8b chunks=2: 12 × 3 × 1)
+# = 108 logs total
 
 # Sanity-check one log carries the [real_measure] + [stage_time] +
 # Average iteration time lines:
 docker exec hetu grep -E "real_measure|stage_time|Average iter" \
-  galvatron/models/moe/logs/cost_model_real_tp1_ep4_zero2sdp_bsz4_fsepoff.log
+  galvatron/models/moe/logs/cost_model_real_tp1_ep4_zero2sdp_bsz4_fsepon.log
 ```
 
 ---
@@ -556,6 +649,27 @@ docker exec hetu python3 \
   /root/Galvatron/galvatron/models/moe/scripts/cost_model_alpha_beta.py
 ```
 
+### 10.5 Multi-world matching-shape drift (PP > 1)
+
+```bash
+docker exec hetu python3 \
+  /root/Galvatron/galvatron/models/moe/scripts/validate_unseen_drift.py
+```
+
+Expected after Step 8 multi-world sweep (Qwen3-30B-A3B, nl=12):
+
+| Config | Δt | Δm |
+|---|---:|---:|
+| PP=2 mbsz=4 ch=1 | +0.6 % | −1.5 % |
+| PP=2 mbsz=4 ch=2 | −1.8 % | −1.0 % |
+| PP=2 mbsz=4 ch=4 | −0.6 % | −1.0 % |
+| PP=2 mbsz=2 ch=1 | −2.7 % | −0.8 % |
+| PP=2 mbsz=2 ch=2 | −5.1 % | −0.5 % |
+| PP=1 mbsz=4 ch=1 | −7.7 % | −7.0 % |
+
+PP > 1 max |Δt| ≤ 5.1 % (down from +13.3 % pre-multi-world). Overall
+bounded by the unchanged PP=1 baseline.
+
 ---
 
 ## 11. Search (~1 sec, CPU)
@@ -600,6 +714,27 @@ docker exec hetu python3 \
 Reports the optimal config separately at each `micro_bsz` value, with
 calibrated-only filtering. At gbsz=128 the optimum is the same shape as
 gbsz=4 (`PP=2 EP=2 zero2sdp fsep=off, micro_bsz=4`) at ~5,613 ms/iter.
+
+#### gbsz=128 stress test (24 layers)
+
+Cost-model query at `nl=24, gbsz=128` across PP ∈ {1, 2, 4} (peak ≤ 72.6 GB):
+
+| pp tp ep mbsz chunks | iter_ms | peak_mb | feasible |
+|---|---:|---:|:---|
+| 1, 1, 4, 4, 32 | 80715 | 69828 | ✅ |
+| 2, 2, 1, 4, 32 | **47195** | **49364** | ✅ best |
+| 4, 1, 1, 4, 32 | 123401 | 53299 | ✅ |
+| 2, 1, 2, 4, 32 | 31906 | 76925 | ❌ OOM (+4 GB) |
+
+#### Coverage gaps
+
+- **Per-component (attention/mlp) profile not populated by default.**
+  Search reports `Per-component attention time slope missing` for
+  shapes outside the calibrated `(tp, ep, mbsz)` domain. Re-run the
+  Step 8 sweeps with `DEFAULT_PROFILE_UNITS="all attention mlp"` to
+  unlock those paths (~+50 min total across all three worlds).
+- **48 layers at PP=1 dp=1 is genuinely OOM** (~140 GB peak vs 72.6 GB
+  budget). Need DP > 1 or PP > 1 to fit.
 
 ### 11.3 Top-config validation (smoke test)
 
@@ -724,10 +859,14 @@ Step 8b. If the gap remains, the chunks_overhead loader in
 
 ### "No computation profile found for tp=X, ep=Y" in search
 
-Step 3 / Step 4 / Step 6 didn't produce a profile at that (tp, ep).
+Step 3 / Step 4 didn't produce a profile at that (tp, ep), and the
+runtime calibration matrix doesn't cover the queried shape either.
 Either calibrate it (re-run the relevant profile script with that
-(tp, ep) added to the matrix) or use `--trust calibrated` to filter
-the search to runtime-profile-anchored configs only.
+(tp, ep) added to the matrix; or for FSEP-on, the legacy
+`_legacy/profile_computation_frozen.sh` produces per-(tp, ep) compute
+files that the loader reads as a tertiary fall-back) or use
+`--trust calibrated` to filter the search to runtime-profile-anchored
+configs only.
 
 ---
 
@@ -744,13 +883,13 @@ cd /workspace/Galvatron/galvatron/models/moe
 docker exec hetu bash -lc "cd /root/Galvatron/galvatron/models/moe && bash scripts/profile_computation.sh"
 docker exec hetu bash -lc "cd /root/Galvatron/galvatron/models/moe && NUM_GPUS_PER_NODE=2 bash scripts/profile_memory.sh"
 docker exec hetu python3 /root/Galvatron/galvatron/models/moe/scripts/profile_embedding_lmhead.py
-docker exec hetu bash -lc "cd /root/Galvatron/galvatron/models/moe && bash scripts/profile_computation_frozen.sh"
-docker exec hetu bash -lc "cd /root/Galvatron/galvatron/models/moe && bash scripts/profile_memory_frozen.sh"
+# Step 6 (profile_computation_frozen.sh) moved to _legacy/ — see Section 6.
+# Step 7 (profile_memory_frozen.sh)      moved to _legacy/ — see Section 7.
 
-# Calibration sweeps (step 8)
-docker exec hetu bash -lc "cd /root/Galvatron && bash galvatron/models/moe/scripts/cost_model_real_test.sh > /tmp/step8.log 2>&1"
+# Calibration sweeps (step 8) — main matrix covers gbsz ∈ {4, 2, 1};
+# the chunks=2 sister runs separately for per-microbatch slopes.
+docker exec hetu bash -lc "cd /root/Galvatron && bash galvatron/models/moe/scripts/cost_model_real_test.sh         > /tmp/step8.log  2>&1"
 docker exec hetu bash -lc "cd /root/Galvatron && bash galvatron/models/moe/scripts/cost_model_real_test_chunks2.sh > /tmp/step8b.log 2>&1"
-docker exec hetu bash -lc "cd /root/Galvatron && bash galvatron/models/moe/scripts/cost_model_real_test_gap_fill.sh > /tmp/step8c.log 2>&1"
 
 # Aggregate (step 9)
 docker exec hetu python3 /root/Galvatron/galvatron/models/moe/scripts/profile_cost_model_terms.py
