@@ -636,11 +636,11 @@ class Attention(MegatronModule, ABC):
                 # TODO VIJAY: simplify
                 if inference_context is None or inference_context.is_static_batching():
                     if torch.distributed.get_rank() == 0:
-                        print(
-                            f"[rope] query={tuple(query.shape)} "
-                            f"q_pos_emb={tuple(q_pos_emb.shape)}",
-                            flush=True,
-                        )
+                        # print(
+                        #     f"[rope] query={tuple(query.shape)} "
+                        #     f"q_pos_emb={tuple(q_pos_emb.shape)}",
+                        #     flush=True,
+                        # )
                     query = apply_rotary_pos_emb(
                         query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
                     )

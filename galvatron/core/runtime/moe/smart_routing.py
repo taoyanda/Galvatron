@@ -148,15 +148,15 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
         # freeze knob was wired through. Layer 0 only to avoid N-layer spam.
         if self.layer_number == 0 and torch.distributed.get_rank() == 0:
             cfg = self.async_lp_solver_config
-            print(
-                f"[solver_init] enabled={cfg['enabled']} "
-                f"freeze_after_iter={cfg['freeze_after_iter']} "
-                f"hidden_size={cfg['hidden_size']} "
-                f"expert_capacity_per_device={cfg['expert_capacity_per_device']} "
-                f"comp_cfg={cfg['computation_config_path']} "
-                f"net_cfg={cfg['network_config_path']}",
-                flush=True,
-            )
+            # print(
+            #     f"[solver_init] enabled={cfg['enabled']} "
+            #     f"freeze_after_iter={cfg['freeze_after_iter']} "
+            #     f"hidden_size={cfg['hidden_size']} "
+            #     f"expert_capacity_per_device={cfg['expert_capacity_per_device']} "
+            #     f"comp_cfg={cfg['computation_config_path']} "
+            #     f"net_cfg={cfg['network_config_path']}",
+            #     flush=True,
+            # )
 
     def get_smart_routing(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
@@ -590,11 +590,11 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
                 hist_sum = int(np.asarray(hist).sum())
             except Exception:
                 hist_sum = -1
-            print(
-                f"[solver_submit] layer={self.layer_number} iter={self.solver_iter} "
-                f"hist_tokens_sum={hist_sum}",
-                flush=True,
-            )
+            # print(
+            #     f"[solver_submit] layer={self.layer_number} iter={self.solver_iter} "
+            #     f"hist_tokens_sum={hist_sum}",
+            #     flush=True,
+            # )
         self.async_lp_task_id = submit_lp_optimization(
             history_data=self.total_num_global_tokens_per_expert,
             layer_number=self.layer_number,
@@ -693,11 +693,11 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
             except Exception:
                 p_sum, p_shape = -1, None
             if self.solver_iter <= 3 or self.solver_iter % 5 == 0:
-                print(
-                    f"[solver_result] layer={self.layer_number} iter={self.solver_iter} "
-                    f"placement_shape={p_shape} placement_sum={p_sum}",
-                    flush=True,
-                )
+                # print(
+                #     f"[solver_result] layer={self.layer_number} iter={self.solver_iter} "
+                #     f"placement_shape={p_shape} placement_sum={p_sum}",
+                #     flush=True,
+                # )
 
         # Past freeze, discard the new placement so the dispatcher keeps the
         # last applied layout. We DO let the solver compute the result (we just
