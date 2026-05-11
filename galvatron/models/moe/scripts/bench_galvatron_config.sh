@@ -48,6 +48,8 @@ fi
 
 GALVATRON_CONFIG="$1"
 FSEP_MODE="${2:-on}"
+CAP="${3:-1}"
+
 
 if [ ! -f "${GALVATRON_CONFIG}" ]; then
     echo "[error] galvatron config not found: ${GALVATRON_CONFIG}" >&2
@@ -139,7 +141,7 @@ export OMP_NUM_THREADS=8
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export CUDA_HOME='/usr/local/cuda-12.1'
 export CUDA_MPS_PIPE_DIRECTORY=${CUDA_MPS_PIPE_DIRECTORY:-/tmp/no-such-mps-bench-$$}
-export TORCHINDUCTOR_COMPILE_THREADS=1
+# export TORCHINDUCTOR_COMPILE_THREADS=1
 export TORCH_NCCL_AVOID_RECORD_STREAMS=${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export ENABLE_SOLVER=${ENABLE_SOLVER:-1}
@@ -158,7 +160,7 @@ fi
 # ─── workload constants ──────────────────────────────────────────────────────
 MODEL_SIZE=${MODEL_SIZE:-qwen-30b-a3b-e128k8}
 NUM_GLOBAL_EXPERTS=${NUM_GLOBAL_EXPERTS:-128}
-CAP=$(( NUM_GLOBAL_EXPERTS / EP ))
+
 SEQ_LEN=${SEQ_LEN:-4096}
 EPOCHS=${EPOCHS:-20}
 TIMEOUT_SEC=${TIMEOUT_SEC:-1800}
@@ -204,15 +206,17 @@ echo "  log: ${LOG_PATH}"
 echo "========================================================"
 
 rc=0
+# --global_ep_deg ${EP} \
+# --global_tp_of_ep_deg ${TP_OF_EP} \
+
 timeout --kill-after=120 "${TIMEOUT_SEC}" \
     ${LAUNCHER} train_dist_frozen.py \
         --galvatron_config_path "${GALVATRON_CONFIG}" \
         --quiet \
         --shape_order SBH --dropout_prob 0.0 \
         ${FSEP_FLAG} \
-        --global_ep_deg ${EP} \
-        --global_tp_of_ep_deg ${TP_OF_EP} \
         --expert_capacity_per_device ${CAP} \
+        --chunks ${CHUNKS} \
         --set_experts_manually 0 \
         --model_size ${MODEL_SIZE} \
         --hidden_size 2048 --intermediate_size 768 --head_dim 64 \
