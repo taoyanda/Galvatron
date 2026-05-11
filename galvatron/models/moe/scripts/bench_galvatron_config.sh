@@ -216,7 +216,6 @@ timeout --kill-after=120 "${TIMEOUT_SEC}" \
         --shape_order SBH --dropout_prob 0.0 \
         ${FSEP_FLAG} \
         --expert_capacity_per_device ${CAP} \
-        --chunks ${CHUNKS} \
         --set_experts_manually 0 \
         --model_size ${MODEL_SIZE} \
         --hidden_size 2048 --intermediate_size 768 --head_dim 64 \
