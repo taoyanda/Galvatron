@@ -83,6 +83,29 @@ def get_hybrid_parallel_configs_api(config, args, model_info):
         args.vocab_tp = vtp
         args.vocab_sp = vsp
 
+        # JSON-mode MoE: per-layer EP / TP-of-EP support. Mirrors the
+        # tp_sizes_enc encoding (comma-separated str via str2array; a JSON
+        # list is also accepted for callers that emit a native array).
+        # Falls back to args.global_ep_deg / args.global_tp_of_ep_deg
+        # broadcast for back-compat with pre-MoE configs produced before
+        # the search wrote these fields.
+        if "ep_sizes_enc" in galvatron_config:
+            val = galvatron_config["ep_sizes_enc"]
+            ep_sizes_enc = str2array(val) if isinstance(val, str) else list(val)
+        else:
+            ep_sizes_enc = total_layer_num * [args.global_ep_deg]
+        if "tp_of_ep_sizes_enc" in galvatron_config:
+            val = galvatron_config["tp_of_ep_sizes_enc"]
+            tp_of_ep_sizes_enc = str2array(val) if isinstance(val, str) else list(val)
+        else:
+            tp_of_ep_sizes_enc = total_layer_num * [args.global_tp_of_ep_deg]
+        assert len(ep_sizes_enc) == total_layer_num, (
+            f"ep_sizes_enc length {len(ep_sizes_enc)} != total_layer_num {total_layer_num}"
+        )
+        assert len(tp_of_ep_sizes_enc) == total_layer_num, (
+            f"tp_of_ep_sizes_enc length {len(tp_of_ep_sizes_enc)} != total_layer_num {total_layer_num}"
+        )
+
     if pp_divide is None:
         avg_layer_num = total_layer_num // pp_deg
         last_layer_num = total_layer_num - avg_layer_num * (pp_deg - 1)

@@ -521,7 +521,9 @@ def train(args):
             # Emit the stage-time summary as soon as we have all the samples
             # in the runtime profiler's averaging window. We can't wait until
             # the iter loop ends — `profile_time_end` at iter=end_iter-1 may
-            # terminate the process via save_profiled_time().
+            # terminate the process via save_profiled_time(). Always-print
+            # (not _diag-gated): this line is the benchmark output that
+            # bench_galvatron_config.sh greps for under --profile 0 + --quiet.
             if rank == 0 and not _stage_logged:
                 _s, _e = getattr(profiler, "start_iter", 10), getattr(
                     profiler, "end_iter", 20
@@ -530,11 +532,11 @@ def train(args):
                     _fb_win = _fb_samples[_s:_e]
                     _op_win = _opt_samples[_s:_e]
                     if _fb_win:
-                        _diag(
-                            args,
+                        print(
                             f"[stage_time] fwd_bwd_ms={sum(_fb_win)/len(_fb_win):.4f} "
                             f"opt_ms={sum(_op_win)/len(_op_win):.4f} "
                             f"window=[{_s},{_e})",
+                            flush=True,
                         )
                         _stage_logged = True
 
@@ -546,17 +548,18 @@ def train(args):
             torch.distributed.barrier()
     # Stage-time summary (rank 0): mean over the runtime profiler's
     # averaging window so the numbers are directly comparable to its
-    # printed `Average iteration time is: X s`.
+    # printed `Average iteration time is: X s`. Always-print — see the
+    # in-loop emitter above for rationale.
     if rank == 0 and _fb_samples:
         s, e = getattr(profiler, "start_iter", 10), getattr(profiler, "end_iter", 20)
         fb = _fb_samples[s:e]
         op = _opt_samples[s:e]
         if fb:
-            _diag(
-                args,
+            print(
                 f"[stage_time] fwd_bwd_ms={sum(fb)/len(fb):.4f} "
                 f"opt_ms={sum(op)/len(op):.4f} "
                 f"window=[{s},{e})",
+                flush=True,
             )
 
 
