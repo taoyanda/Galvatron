@@ -161,8 +161,8 @@ class MoERouter(nn.Module):
                     with torch.no_grad():
                         diff = int((routing_map != cached_routing_map).sum().item())
                         total = int(routing_map.numel())
-                    if torch.distributed.get_rank() == 0:
-                        tag = "MATCH" if diff == 0 else "MISMATCH"
+                    # if torch.distributed.get_rank() == 0:
+                        # tag = "MATCH" if diff == 0 else "MISMATCH"
                         # print(
                         #     f"[router_drift] layer={self.idx} "
                         #     f"check={self._static_check_count}: "

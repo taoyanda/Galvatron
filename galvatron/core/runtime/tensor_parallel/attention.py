@@ -635,7 +635,7 @@ class Attention(MegatronModule, ABC):
             if q_pos_emb is not None:
                 # TODO VIJAY: simplify
                 if inference_context is None or inference_context.is_static_batching():
-                    if torch.distributed.get_rank() == 0:
+                    # if torch.distributed.get_rank() == 0:
                         # print(
                         #     f"[rope] query={tuple(query.shape)} "
                         #     f"q_pos_emb={tuple(q_pos_emb.shape)}",

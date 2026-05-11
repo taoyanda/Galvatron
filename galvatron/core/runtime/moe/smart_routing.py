@@ -692,7 +692,7 @@ class MoEAlltoAllSmartTokenDispatcher(MoETokenDispatcher):
                 p_shape = tuple(p_array.shape)
             except Exception:
                 p_sum, p_shape = -1, None
-            if self.solver_iter <= 3 or self.solver_iter % 5 == 0:
+            # if self.solver_iter <= 3 or self.solver_iter % 5 == 0:
                 # print(
                 #     f"[solver_result] layer={self.layer_number} iter={self.solver_iter} "
                 #     f"placement_shape={p_shape} placement_sum={p_sum}",
